@@ -1,0 +1,7 @@
+{
+  "_comment": "Measured, and deliberately the RAW figure: `aiken check` reports 998,573 mem / 328,836,213 steps for bench_harvest_1, the operator's bot-signed path at the batch size the keeper actually submits. The paired bench_fixture_1 is NOT subtracted here. That subtraction removes the fixture test's own list traversal along with the construction, which makes it a LOWER bound on the validator \u2014 wrong by 3x on the escape pair, which the benches put at 7,456 mem where the same script measured 23,400 on chain. A budget that understates is worse than no budget, so this over-counts instead: some fixture construction is included, and it is still 6.1% of what a mainnet transaction may spend. The keeper builds one order per transaction (adam-oc maker-actions.ts plans one reprice or cancel recipe per order and the CLI translator is never handed more than one spend), so N=1 is the deployed worst case. The benches also run N=4/8/16/32 for the SHAPE of the curve: size grows linearly, ex-units quadratically (cardano-swaps rescans the input list once per input), and size is what binds. Absolute ceilings come from built transactions, not from here: a one-order client escape measured 13,370 bytes on preprod 2026-08-06, of which 12,668 is the three inline scripts, and 56 orders is the last batch that fits. Cap checked live via ogmios: maxExecutionUnitsPerTransaction is {memory 16,500,000, cpu 10,000,000,000}.",
+  "exUnits": {
+    "mem": 998573,
+    "steps": 328836213
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "counts": {
+    "aiken.constant_predicate": 0,
+    "aiken.expect": 3,
+    "aiken.todo": 0,
+    "aiken.trace": 0,
+    "aiken.vacuous_test": 0,
+    "coq.admitted": 0,
+    "coq.axiom": 0,
+    "dafny.assume": 0,
+    "dafny.axiom": 0,
+    "dafny.extern": 0,
+    "dafny.verify_false": 0,
+    "flags.verification_off": 0,
+    "isabelle.sorry": 0,
+    "lean.axiom": 0,
+    "lean.native_decide": 0,
+    "lean.sorry": 0,
+    "rust.assume": 0,
+    "rust.external_body": 0,
+    "rust.trusted": 0,
+    "tla.assume": 0
+  },
+  "note": "Escape-hatch counts. proof-guard.py --check fails if any category rises. Lowering one (proving what was assumed) is always allowed; re-record with --baseline and explain the rise in review if a count must go up.",
+  "version": 1
+}

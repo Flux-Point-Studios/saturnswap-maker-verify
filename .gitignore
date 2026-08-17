@@ -1,0 +1,8 @@
+build/
+__pycache__/
+*.pyc
+rehearsal/
+*.skey
+*.vkey
+*.addr
+.env*
