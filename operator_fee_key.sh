@@ -86,7 +86,5 @@ OPERATOR_FEE_ADDRESS=$ADDR
        OperatorFeeSigningKeyPath names (mode 600, containing dir 700). Do it
        from your machine; do not send it through anyone else.
     3. The vkh above goes into MmaasFeeKeeper.OperatorFeeVkh. The keeper
-       derives the hash from the key it was given and refuses to run a
-       cycle unless it equals that value, so a mismatch fails closed
-       instead of surfacing as an unexplained ledger rejection.
+       refuses to start if the on-disk key does not hash to it.
 EOF

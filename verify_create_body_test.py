@@ -448,10 +448,17 @@ def test_composite_body_key_refused(fx):
 
 def test_duplicate_map_key_refused():
     # The hand-rolled reader must reject duplicate CBOR map keys (cardano-node does), so the two decoders
-    # can never disagree about which value a repeated key carries.
+    # can never disagree about which value a repeated key carries. There is now only ONE reader — it lives
+    # in verify_ceremony and raises that module's error, which run() already catches alongside Refusal.
     buf = bytes([0xA2, 0x00, 0x01, 0x00, 0x02])  # {0:1, 0:2} — key 0 twice
-    with pytest.raises(vcb.Refusal):
+    with pytest.raises((vcb.Refusal, vc.CeremonyError)):
         vcb.cbor_load(buf)
+
+
+def test_the_reader_is_the_one_verify_ceremony_ships():
+    # Two decoders in one tree is how a duplicate COSE label ends up picking a different
+    # value than the signer used in one tool and not the other.
+    assert vcb.cbor_load is vc.cbor_load
 
 
 def test_indefinite_empty_constructor_decodes():

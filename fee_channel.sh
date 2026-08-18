@@ -1,24 +1,20 @@
 #!/bin/bash
 # MMaaS Phase-0 fee channel, CLIENT side (FEE_COLLECTION_DESIGN.md, "Phase 0 draw — D"): a prepaid
-# native-script channel the client funds and the operator's keeper draws metered fees from. What
-# production ships is `any[ all[opA, opB], client ]` — the operator branch needs TWO independently
-# held keys — and the legacy `any[opA, client]` remains for a one-key operator.
+# native-script channel `any[operator_fee_hotkey, client_owner_vkh]` the client funds and the
+# operator's keeper draws metered fees from.
 #
-# What this tool PROVES: the channel you fund is derived LOCALLY from the operator's published key
-# hashes and yours, in the CANONICAL ordering — operator key(s) FIRST, client key LAST. That
-# ordering is a cross-repo contract; the backend keeper derives the identical script, and
-# reordering the keys changes the hash and the address. The channel address is ALWAYS re-derived
-# from those keys and never accepted as an input, so nobody can hand you a lookalike address only
-# they control.
+# What this tool PROVES: the channel you fund is derived LOCALLY from exactly two key hashes — the
+# operator's published fee hotkey and yours — in the CANONICAL ordering: operator key FIRST, client
+# key SECOND. That ordering is a cross-repo contract; the backend keeper derives the identical
+# script, and reordering the keys changes the hash and the address. The channel address is ALWAYS
+# re-derived from those keys and never accepted as an input, so nobody can hand you a lookalike
+# address only they control.
 #
-# What this tool CANNOT prove: a fee bound. No native script can express one. Under the 2-of-2, a
-# compromise of ONE operator key or host draws nothing — the second key lives on separate
-# infrastructure behind a service that judges each draw against a published destination, per-draw
-# ceiling and rolling window (GET /identity states them, and codeDigest says what code answers). A
-# deliberate operator using both keys can still draw the balance, so the metered fee remains a
-# commercial promise rather than a ledger rule: fund only what you are prepared to see drawn. Your
-# hard guarantees are (1) exposure is capped at the balance you chose and (2) --mode reclaim
-# returns every channel UTxO to you with your key alone, zero operator cooperation.
+# What this tool CANNOT prove: a fee bound. `any` means EITHER key spends alone — the operator can
+# draw the entire channel balance at any time; the metered fee is a commercial promise, not a
+# ledger rule. Fund only what you are prepared to see drawn. Your hard guarantees are (1) exposure
+# is capped at the balance you chose and (2) --mode reclaim returns every channel UTxO to you with
+# your key alone, zero operator cooperation.
 #
 # What you must obtain YOURSELF: the operator's fee vkh over a channel you trust — verify it
 # out-of-band before funding, because funding a channel built on a stranger's vkh lets that

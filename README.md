@@ -18,7 +18,9 @@ python3 verify_ceremony.py \
   --network mainnet \
   --decimals <your token's decimals> \
   --expect-band-ada-per-display-unit <low>:<high> \
-  --expect-order-address <the address SaturnSwap gave you>
+  --expect-order-address <the address SaturnSwap gave you> \
+  --possession-proof possession-proof.json \
+  --my-address <your own wallet address>
 ```
 
 It rebuilds the validator from the source in this repo, re-applies your nine
@@ -26,6 +28,30 @@ parameters, derives the address, and **refuses loudly** if anything disagrees.
 `--derive-only` shows what your parameters produce without asserting a verdict.
 
 Requires [aiken](https://aiken-lang.org) v1.1.22 and Python 3.
+
+### Proving the escape-hatch key is yours
+
+A verdict is a sentence about *your* protections, so this tool will not print one
+until somebody has proved they can sign for `client_owner_vkh`. Otherwise it would
+only be checking that our arithmetic is self-consistent.
+
+Three ways to prove it, and you need exactly one:
+
+| you have | pass |
+|---|---|
+| a browser wallet | `--possession-proof possession-proof.json --my-address <your address>` — the onboarding page produces that file from a wallet signature |
+| a signing key file | `--my-skey-file payment.skey` |
+| a hardware or offline signer | `--possession-proof <witness or detached signature>` (see `--derive-only` for the challenge) |
+
+**`--my-address` must be an address you recognise as your own.** It is the one
+input that comes from you rather than from us, and the tool binds it to the
+proof's own header, to the ceremony's payout address, and to the key that signed.
+Supplied with a non-wallet proof it is refused rather than ignored, because a flag
+that is silently dropped is worse than one that was never there.
+
+What no tool can establish: that you are the *only* holder of that key. That
+follows from you having generated it yourself and produced the signature yourself.
+**If we handed you either one, the verdict is worth nothing.**
 
 ## The published mainnet parameters
 
@@ -35,15 +61,23 @@ any source that is not us.
 | parameter | value |
 |---|---|
 | `adam_bot_pkh` | `cea98dfce26e0ffbf5ab892edcb8f8ab8b794d5390f80ec0b9aafed3` |
-| `dapp_hash` | `1d6cff26bcab91d2061aad0bd259cbb7d76d25ced2eeaed5926a42ad` |
-| `beacon_id` | `c4d7d117d9ebcde6db28db40837ff2b1401e9eaaa6eecea9e070e209` |
+| `dapp_hash` | `11928a3ac3b65edbf103ea6bb3362e39b879a36f02897df31c40917b` |
+| `beacon_id` | `8a199a17ef4517215945aaf3c8c5204c60fd94d34c46d341e99c8fcf` |
 | `fee_address` | `addr1v9wr69p2tx8dx2lat8rzznahxh4xhfl075yzm8uxmth4tvcf3lx47` |
 | `fee_bps` | `20` (0.20%) |
 
 Each is checkable on chain rather than by trust:
 
-- `dapp_hash` is the payment credential of any live order address.
-- `beacon_id` is the policy id of the beacon tokens resting on any order.
+- `beacon_id` is a policy id, which *is* the hash of its own minting script. Fetch
+  that script from any mainnet indexer and read the error strings inside it: they
+  say `Two-way swaps must have exactly three kinds of beacons`, `Wrong
+  asset1_beacon` and `Wrong asset2_beacon`. A **one-way** policy says `One-way`
+  and `Wrong offer_beacon` instead — that is how the two deployments are told
+  apart, and they are otherwise indistinguishable. This validator is two-way: its
+  datum has twelve fields with an `asset1_price` and an `asset2_price`, where the
+  one-way datum has eleven and a single `swap_price`.
+- `dapp_hash` appears inside that same beacon script as an applied parameter, so
+  one fetch checks both rows.
 - `adam_bot_pkh` is the payment credential of
   `addr1v882nr0uufhql7l44wyjah9clz4ck72d2wg0srkqhx40a5c6g5gjp`, the address that
   key funds and has signed from many times on mainnet.

@@ -57,126 +57,14 @@ class Refusal(Exception):
 # operator could influence, only on python3.
 # ---------------------------------------------------------------------------
 
-class _Tag:
-    __slots__ = ("tag", "value")
+# CBOR decoding lives in verify_ceremony.py — one decoder, because the divergence
+# that matters is subtle: only one of two copies refusing duplicate map keys is
+# exactly how a repeated label yields a different value than the signer used.
+_Tag = vc._Tag
+_Cbor = vc._Cbor
+_hashable = vc._hashable
+cbor_load = vc.cbor_load
 
-    def __init__(self, tag, value):
-        self.tag = tag
-        self.value = value
-
-
-class _Cbor:
-    def __init__(self, buf):
-        self.b = buf
-        self.i = 0
-
-    def _u(self, n):
-        v = int.from_bytes(self.b[self.i:self.i + n], "big")
-        self.i += n
-        return v
-
-    def _head(self):
-        first = self.b[self.i]
-        self.i += 1
-        major, info = first >> 5, first & 0x1F
-        if info < 24:
-            return major, info, False
-        if info == 24:
-            return major, self._u(1), False
-        if info == 25:
-            return major, self._u(2), False
-        if info == 26:
-            return major, self._u(4), False
-        if info == 27:
-            return major, self._u(8), False
-        if info == 31:
-            return major, None, True  # indefinite
-        raise Refusal(f"unsupported CBOR additional-info {info}")
-
-    def read(self):
-        major, arg, indefinite = self._head()
-        if major == 0:
-            return arg
-        if major == 1:
-            return -1 - arg
-        if major == 2:
-            if indefinite:
-                chunks = bytearray()
-                while not self._at_break():
-                    chunks += self.read()
-                return bytes(chunks)
-            raw = self.b[self.i:self.i + arg]
-            self.i += arg
-            return bytes(raw)
-        if major == 3:
-            if indefinite:
-                parts = []
-                while not self._at_break():
-                    parts.append(self.read())
-                return "".join(parts)
-            raw = self.b[self.i:self.i + arg]
-            self.i += arg
-            return raw.decode("utf-8", "surrogatepass")
-        if major == 4:
-            items = []
-            if indefinite:
-                while not self._at_break():
-                    items.append(self.read())
-            else:
-                for _ in range(arg):
-                    items.append(self.read())
-            return items
-        if major == 5:
-            out = {}
-            if indefinite:
-                while not self._at_break():
-                    k = _hashable(self.read())
-                    if k in out:
-                        raise Refusal("duplicate CBOR map key — cardano-node rejects these, so refuse "
-                                      "rather than silently pick one value the node would not")
-                    out[k] = self.read()
-            else:
-                for _ in range(arg):
-                    k = _hashable(self.read())
-                    if k in out:
-                        raise Refusal("duplicate CBOR map key — cardano-node rejects these, so refuse "
-                                      "rather than silently pick one value the node would not")
-                    out[k] = self.read()
-            return out
-        if major == 6:
-            return _Tag(arg, self.read())
-        if major == 7:
-            if arg == 20:
-                return False
-            if arg == 21:
-                return True
-            if arg in (22, 23):
-                return None
-            raise Refusal(f"unsupported CBOR simple/float value {arg}")
-        raise Refusal(f"unsupported CBOR major type {major}")
-
-    def _at_break(self):
-        if self.b[self.i] == 0xFF:
-            self.i += 1
-            return True
-        return False
-
-
-def _hashable(key):
-    """CBOR map keys are rarely composite, but Conway's redeemers map is keyed by [tag, index]
-    arrays. This verifier only ever looks up int and byte-string keys; composite keys just need a
-    hashable stand-in so decoding does not abort."""
-    if isinstance(key, list):
-        return tuple(_hashable(k) for k in key)
-    if isinstance(key, _Tag):
-        return ("__tag__", key.tag, _hashable(key.value))
-    if isinstance(key, dict):
-        return tuple(sorted((repr(k), _hashable(v)) for k, v in key.items()))
-    return key
-
-
-def cbor_load(buf):
-    return _Cbor(buf).read()
 
 
 # ---------------------------------------------------------------------------

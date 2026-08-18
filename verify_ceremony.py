@@ -64,6 +64,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
 from decimal import Decimal, localcontext
 from fractions import Fraction
@@ -637,6 +638,184 @@ def vkh_from_skey_file(path, cli):
 
 
 # ---------------------------------------------------------------------------
+# CBOR decoding. Hand-rolled for the same reason escape.sh hashes its own scripts:
+# the client's funding safety must not depend on a decoder the operator could
+# influence, only on python3. verify_create_body.py imports these — one decoder,
+# because the divergence that matters is subtle (only one of two copies refusing
+# duplicate map keys is exactly how a COSE_Key with a repeated label yields a
+# different `x` than the signer used).
+# ---------------------------------------------------------------------------
+
+class _Tag:
+    __slots__ = ("tag", "value")
+
+    def __init__(self, tag, value):
+        self.tag = tag
+        self.value = value
+
+
+class _Cbor:
+    """`strict` refuses indefinite-length items outright. A COSE_Sign1 has exactly
+    one conformant encoding, so anything else is either a wallet this tool has not
+    been proven against or an attempt to make two byte-different files verify
+    identically; both must stop rather than be guessed at."""
+
+    def __init__(self, buf, strict=False):
+        self.b = buf
+        self.i = 0
+        self.strict = strict
+
+    def _need(self, n):
+        if self.i + n > len(self.b):
+            raise CeremonyError(
+                f"CBOR ends mid-item: {n} more byte(s) were declared than the buffer holds")
+
+    def _u(self, n):
+        self._need(n)
+        v = int.from_bytes(self.b[self.i:self.i + n], "big")
+        self.i += n
+        return v
+
+    def _canonical(self, value, floor):
+        """Shortest-form heads only. A longer head encodes the same value, so without
+        this one genuine signature re-frames into an unbounded family of byte-distinct
+        proofs — 5840 as 590040, and so on — and every receipt or de-duplication keyed
+        on a proof's bytes stops meaning anything."""
+        if self.strict and value < floor:
+            raise CeremonyError(
+                f"CBOR head is not shortest-form ({value} written in a wider field). This "
+                f"tool accepts one encoding so that one signature is one proof")
+        return value
+
+    def _head(self):
+        self._need(1)
+        first = self.b[self.i]
+        self.i += 1
+        major, info = first >> 5, first & 0x1F
+        if info < 24:
+            return major, info, False
+        if info == 24:
+            return major, self._canonical(self._u(1), 24), False
+        if info == 25:
+            return major, self._canonical(self._u(2), 0x100), False
+        if info == 26:
+            return major, self._canonical(self._u(4), 0x10000), False
+        if info == 27:
+            return major, self._canonical(self._u(8), 0x100000000), False
+        if info == 31:
+            if self.strict:
+                raise CeremonyError(
+                    "CBOR uses an indefinite-length item. This tool verifies one canonical "
+                    "encoding, so a proof it cannot re-serialise byte for byte is refused "
+                    "rather than guessed at")
+            return major, None, True
+        raise CeremonyError(f"unsupported CBOR additional-info {info}")
+
+    def _slice(self, n):
+        self._need(n)
+        raw = self.b[self.i:self.i + n]
+        self.i += n
+        return bytes(raw)
+
+    def read(self):
+        major, arg, indefinite = self._head()
+        if major == 0:
+            return arg
+        if major == 1:
+            return -1 - arg
+        if major == 2:
+            if indefinite:
+                chunks = bytearray()
+                while not self._at_break():
+                    chunks += self.read()
+                return bytes(chunks)
+            return self._slice(arg)
+        if major == 3:
+            if indefinite:
+                parts = []
+                while not self._at_break():
+                    parts.append(self.read())
+                return "".join(parts)
+            return self._slice(arg).decode("utf-8", "surrogatepass")
+        if major == 4:
+            items = []
+            if indefinite:
+                while not self._at_break():
+                    items.append(self.read())
+            else:
+                for _ in range(arg):
+                    items.append(self.read())
+            return items
+        if major == 5:
+            out = {}
+            pairs = []
+            if indefinite:
+                while not self._at_break():
+                    pairs.append((_hashable(self.read()), self.read()))
+            else:
+                for _ in range(arg):
+                    pairs.append((_hashable(self.read()), self.read()))
+            for k, v in pairs:
+                # hash(True) == hash(1) in python, so a map keyed {true: -8} answers
+                # .get(1) — a COSE header carrying NO algorithm label would satisfy the
+                # algorithm check. Booleans and floats are not COSE labels; refuse them.
+                if self.strict and isinstance(k, (bool, float)):
+                    raise CeremonyError(
+                        "a COSE map key must be an integer or a text string, and this one "
+                        "is neither")
+                if k in out:
+                    raise CeremonyError(
+                        "duplicate CBOR map key — cardano-node rejects these, so refuse "
+                        "rather than silently pick one value the node would not")
+                out[k] = v
+            return out
+        if major == 6:
+            return _Tag(arg, self.read())
+        if major == 7:
+            if arg == 20:
+                return False
+            if arg == 21:
+                return True
+            if arg in (22, 23):
+                return None
+            raise CeremonyError(f"unsupported CBOR simple/float value {arg}")
+        raise CeremonyError(f"unsupported CBOR major type {major}")
+
+    def _at_break(self):
+        self._need(1)
+        if self.b[self.i] == 0xFF:
+            self.i += 1
+            return True
+        return False
+
+
+def _hashable(key):
+    """CBOR map keys are rarely composite, but Conway's redeemers map is keyed by [tag, index]
+    arrays. This verifier only ever looks up int and byte-string keys; composite keys just need a
+    hashable stand-in so decoding does not abort."""
+    if isinstance(key, list):
+        return tuple(_hashable(k) for k in key)
+    if isinstance(key, _Tag):
+        return ("__tag__", key.tag, _hashable(key.value))
+    if isinstance(key, dict):
+        return tuple(sorted((repr(k), _hashable(v)) for k, v in key.items()))
+    return key
+
+
+def cbor_load(buf, strict=False, require_exact=False):
+    """`require_exact` refuses trailing bytes. Without it two byte-different files
+    decode alike, so anything keyed on a proof's bytes — a receipt, a de-duplication
+    check — can be defeated by appending padding to a recycled proof."""
+    reader = _Cbor(buf, strict=strict)
+    value = reader.read()
+    if require_exact and reader.i != len(buf):
+        raise CeremonyError(
+            f"{len(buf) - reader.i} trailing byte(s) after the CBOR item. A proof is "
+            f"refused rather than truncated to the part that parses")
+    return value
+
+
+# ---------------------------------------------------------------------------
 # ed25519 verification. ed25519_verify prefers libsodium (PyNaCl), the primitive
 # cardano-node uses, and falls back to this RFC 8032 implementation so a proof can
 # be judged with nothing but python3. RFC 8032's published vectors are a happy-path
@@ -802,6 +981,249 @@ def possession_digest(challenge):
     return hashlib.blake2b(challenge_tx_body(challenge), digest_size=32).digest()
 
 
+# ---------------------------------------------------------------------------
+# CIP-30 signData possession. A browser wallet holds no key FILE, so the two
+# cardano-cli forms below are unreachable for the clients this tool exists to
+# protect: they would verify a params file and then fund an address on a verdict
+# they could not earn.
+#
+# What a wallet CAN produce is a COSE_Sign1 over a payload the page chooses. That
+# payload is therefore the whole security surface, and it is built here — never
+# read out of the proof — from facts the client can check on the wallet's own
+# confirmation screen. A bare challenge hex would be blind-signing: 64 opaque
+# characters name nothing a human can refuse.
+# ---------------------------------------------------------------------------
+
+CIP30_PROOF_TYPE = "CIP30PossessionProof"
+
+
+def _printable(raw, limit=600):
+    """Attacker bytes end up in a report a human reads and a terminal renders. Strip
+    control characters and bound the length rather than echoing whatever was in the file."""
+    text = raw[:limit].decode("utf-8", "replace")
+    text = "".join(c if c == "\n" or c.isprintable() else "\uFFFD" for c in text)
+    return text + ("\n    …truncated" if len(raw) > limit else "")
+
+# COSE label -> value, for the header and key checks. Named rather than inlined
+# because -8 appears as both an algorithm and a curve in different maps.
+_COSE_ALG_EDDSA = -8
+
+# {1: OKP, 3: EdDSA, -1: Ed25519, -2: <32 bytes>} — the exact bytes
+# @emurgo/cardano-message-signing emits, confirmed against three real signData results.
+_COSE_KEY_PREFIX = b"\xa4\x01\x01\x03\x27\x20\x06\x21\x58\x20"
+
+
+def canonical_possession_payload(challenge, network, params, band):
+    """The exact bytes a wallet must sign. Every line is re-derived here from the
+    ceremony this run verified, so a payload naming anything else cannot match.
+
+    The challenge alone would bind the ceremony cryptographically — it already
+    commits to the network, the unapplied validator and all nine parameters, and
+    therefore to the applied script and the order address too. The other lines bind
+    it HUMANLY: they are what the wallet shows, and they are the difference between
+    a client approving a proof and approving a rectangle.
+
+    The order address is deliberately NOT here. It is not known until aiken has
+    applied the parameters, which happens after this runs, and it would add nothing
+    a hostile page could not also fake — the verifier rebuilds this payload from the
+    ceremony either way, so a payload naming a different address is refused. The
+    tool prints the order address beside the payload instead."""
+    return (
+        f"SaturnSwap MMaaS — proof you hold the escape-hatch key\n"
+        f"network: {network}\n"
+        f"your wallet: {params['client_payout_address']}\n"
+        f"our fee: {params['fee_bps']} bps\n"
+        f"your band: {band}\n"
+        f"challenge: {challenge.hex()}\n"
+    )
+
+
+def load_cip30_proof(doc, path):
+    """Structure only. Everything this returns is still the operator's claim until
+    check_possession has bound it to the ceremony and to --my-address."""
+    for field in ("address", "coseSign1", "coseKey"):
+        if not isinstance(doc.get(field), str):
+            raise CeremonyError(
+                f"{path} is a {CIP30_PROOF_TYPE} envelope with no string '{field}'. "
+                f"Re-export it from the onboarding page rather than editing it by hand")
+    if "cborHex" in doc:
+        raise CeremonyError(
+            f"{path} carries both a CIP-30 proof and a cardano-cli 'cborHex'. Which form "
+            f"was actually verified would depend on the order this tool happens to check "
+            f"them in, so it refuses the file instead")
+    try:
+        cose_sign1 = bytes.fromhex(doc["coseSign1"].strip())
+        cose_key = bytes.fromhex(doc["coseKey"].strip())
+    except ValueError as exc:
+        raise CeremonyError(f"{path} holds a coseSign1/coseKey that is not hex: {exc}")
+    return doc["address"].strip(), cose_sign1, cose_key
+
+
+def _cose_protected_bytes(cose_sign1):
+    """The protected header as the ORIGINAL bytes, sliced by cursor offset.
+
+    COSE signs those bytes verbatim. Re-encoding a decoded map would produce a
+    different byte string for any wallet whose head is not shortest-form, and the
+    client would be told their genuine signature "does not sign this ceremony" —
+    the least actionable refusal this tool can emit."""
+    reader = _Cbor(cose_sign1, strict=True)
+    major, arg, _ = reader._head()
+    if major != 4 or arg != 4:
+        raise CeremonyError(
+            "a COSE_Sign1 is a 4-element CBOR array [protected, unprotected, payload, "
+            "signature]; this proof is not one. A tagged (tag 18) or bare signature is "
+            "refused rather than unwrapped")
+    start = reader.i
+    protected = reader.read()
+    if not isinstance(protected, bytes):
+        raise CeremonyError("the COSE protected header is not a byte string")
+    return protected, cose_sign1[start:reader.i], reader
+
+
+def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, expected_payload,
+                       payout_address=None):
+    """Returns (verification_key, address, payload) once the proof holds.
+
+    Nothing about the signed message is read from the file: the caller renders the one
+    payload this ceremony demands, and the challenge line is re-checked here so a wiring
+    bug upstream cannot widen what verifies."""
+    address_claim, cose_sign1, cose_key = load_cip30_proof(doc, path)
+
+    protected_map_bytes, protected_bstr_bytes, reader = _cose_protected_bytes(cose_sign1)
+    protected = cbor_load(protected_map_bytes, strict=True, require_exact=True) if protected_map_bytes else {}
+    if not isinstance(protected, dict):
+        raise CeremonyError("the COSE protected header does not hold a map")
+    if protected.get(1) != _COSE_ALG_EDDSA:
+        raise CeremonyError(
+            f"the proof declares COSE algorithm {protected.get(1)!r}; this tool verifies "
+            f"ed25519 (EdDSA, {_COSE_ALG_EDDSA}) and nothing else")
+
+    if set(protected) != {1, "address"}:
+        raise CeremonyError(
+            f"the COSE protected header carries labels {sorted(map(str, protected))}; this "
+            f"tool accepts exactly the algorithm and the address, so an unknown label cannot "
+            f"mean one thing here and another to a stricter verifier")
+
+    # The unprotected bucket is NOT covered by the signature, so it is attacker-mutable
+    # in both directions: padding it produces byte-different files that verify alike
+    # (defeating anything keyed on a proof's bytes), and setting hashed=true on someone
+    # else's genuine proof forces a refusal. A byte comparison closes both.
+    start = reader.i
+    unprotected = reader.read()
+    if not isinstance(unprotected, dict):
+        raise CeremonyError("the COSE unprotected header does not hold a map")
+    if cose_sign1[start:reader.i] not in (b"\xa0", b"\xa1\x66hashed\xf4"):
+        if unprotected.get("hashed") is True:
+            raise CeremonyError(
+                "your wallet hashed the message before signing it, so what it signed is a "
+                "digest this tool cannot compare against the text you were shown. Sign from "
+                "a wallet that does not hash, or use --my-skey-file")
+        raise CeremonyError(
+            "the COSE unprotected header is not one this tool accepts. It is the one part a "
+            "signature does not cover, so it is pinned to empty or exactly {hashed: false} "
+            "rather than parsed")
+
+    payload = reader.read()
+    if payload is None:
+        raise CeremonyError(
+            "the proof carries no payload (COSE calls this detached). The payload IS the "
+            "sentence you agreed to, so a proof without one is refused — this tool will not "
+            "supply a payload you never saw")
+    if not isinstance(payload, bytes):
+        raise CeremonyError(
+            f"the COSE payload is a {type(payload).__name__}, not a byte string; a "
+            f"conformant signData payload is bytes")
+    signature = reader.read()
+    if not isinstance(signature, bytes) or len(signature) != 64:
+        raise CeremonyError(
+            f"the COSE signature is {len(signature) if isinstance(signature, bytes) else '?'} "
+            f"bytes; an ed25519 signature is 64")
+    if reader.i != len(cose_sign1):
+        raise CeremonyError(
+            f"{len(cose_sign1) - reader.i} trailing byte(s) after the COSE_Sign1")
+
+    if payload != expected_payload:
+        raise CeremonyError(
+            "the proof signs a different message than this ceremony's. What your wallet "
+            "signed was:\n\n"
+            + textwrap.indent(_printable(payload), "    ")
+            + "\n  and this ceremony requires:\n\n"
+            + textwrap.indent(expected_payload.decode(), "    ")
+            + "\n  A proof minted for another ceremony, or before a parameter changed, "
+              "cannot endorse this one")
+    # Asserted independently of how the caller built the payload, so a wiring bug that
+    # rendered it from the wrong network, a stale params snapshot or a None band cannot
+    # quietly widen what this function will accept.
+    if f"challenge: {challenge.hex()}\n".encode() not in payload:
+        raise CeremonyError(
+            "the signed message does not carry this ceremony's challenge line")
+
+    # Pinned to the exact 42 bytes cardano-message-signing emits, rather than parsed.
+    # Every parser ambiguity on the key dies here at once — a duplicated -2 label whose
+    # last value wins, a boolean label, a non-minimal 32-byte head — and each of those
+    # picks a DIFFERENT key than the one that signed.
+    if len(cose_key) != len(_COSE_KEY_PREFIX) + 32 or not cose_key.startswith(_COSE_KEY_PREFIX):
+        if len(cose_key) == len(_COSE_KEY_PREFIX) + 64:
+            raise CeremonyError(
+                "the COSE_Key carries 64 key bytes — the length of an EXTENDED public key. "
+                "signData must return the 32-byte public key, not an xpub")
+        raise CeremonyError(
+            "the COSE_Key is not the canonical Ed25519 OKP key a CIP-30 wallet returns "
+            "(kty OKP, alg EdDSA, crv Ed25519, a 32-byte x, in that order)")
+    vkey = cose_key[len(_COSE_KEY_PREFIX):]
+
+    header_address = protected.get("address")
+    if not isinstance(header_address, bytes):
+        raise CeremonyError("the COSE protected header carries no 'address'")
+
+    # address_to_plutus_data is the decoder the rest of this file already trusts: it
+    # refuses a wrong-network address, Byron/base58, and — because ADDRESS_TYPES has
+    # no 14/15 — a REWARD address, which CIP-8 would otherwise let a client sign with
+    # their STAKE key. That path ends with client_payout_address set to something no
+    # CIP-1852 wallet derives or can witness.
+    _, mine = address_to_plutus_data(my_address, network)
+    if header_address != bech32_decode(my_address)[1]:
+        raise CeremonyError(
+            f"the proof was not signed by the wallet you named. You passed --my-address "
+            f"{my_address}; the proof's own header names a different address")
+
+    # The address is the ONE input a client supplies from their own knowledge. Without
+    # it the tool proves only that somebody holding client_owner_vkh signed — which an
+    # operator who chose that parameter can arrange with their own browser wallet, and
+    # a 56-hex key hash is not something a client can recognise as not-theirs.
+    # The ceremony's payout address must be the SAME address, not merely one paying to
+    # the same key. check_ceremony_coherence constrains only the payment credential, so a
+    # substituted STAKE part shares most of the bech32 string and still passes — and every
+    # payout then lands where the operator holds the delegation.
+    if payout_address is not None and my_address != payout_address:
+        raise CeremonyError(
+            f"you signed with {my_address}, but this ceremony pays out to {payout_address}. "
+            f"Those differ, so proving you hold the one says nothing about the other")
+    if mine["payment_kind"] != "key":
+        raise CeremonyError(
+            f"{my_address} pays to a {mine['payment_kind']}, not to a verification key. "
+            f"The escape hatch has to be a key you can sign with")
+    signer = vkh(vkey)
+    if signer != mine["payment_hash"] or signer != owner_vkh:
+        raise CeremonyError(
+            f"the proof was made by key {signer}, the address it names pays to "
+            f"{mine['payment_hash']}, and the ceremony names {owner_vkh}. All three must be "
+            f"the same key or the proof is about a different one")
+
+    point = _ed_decompress(vkey)
+    if point is None or _ed_is_small_order(point):
+        raise CeremonyError(
+            f"the verification key in {path} is a small-order ed25519 point, not a usable "
+            f"Cardano key: it has no private half, so any 'proof' by it is a published forgery")
+
+    sig_structure = (b"\x84" + _cbor_head(3, len(b"Signature1")) + b"Signature1"
+                     + protected_bstr_bytes + b"\x40" + _cbor_head(2, len(payload)) + payload)
+    if not ed25519_verify(vkey, sig_structure, signature):
+        raise CeremonyError(
+            f"the signature in {path} does not verify against the message it carries")
+    return vkey, my_address, payload
+
+
 def load_possession_proof(path):
     """A signature over the challenge digest, as `(form, vkey_or_None, signature)`.
 
@@ -849,13 +1271,65 @@ def load_possession_proof(path):
     return "detached-signature", None, signature
 
 
-def check_possession(owner_vkh, digest, proof_path, skey_path, vkey_path, cli):
+def check_possession(owner_vkh, digest, proof_path, skey_path, vkey_path, cli,
+                     my_address=None, network=None, challenge=None, expected_payload=None,
+                     payout_address=None):
     """Did the PRIVATE half of client_owner_vkh sign this ceremony's challenge?
 
     Returns a record of what was actually established. Raises only when a proof
     was offered and does not hold — a proof that was never offered is a missing
-    verdict input, not a lie, and is reported as such."""
-    record = {"proved": False, "form": None, "digest": digest.hex()}
+    verdict input, not a lie, and is reported as such.
+
+    `signed_message` is the field a machine consumer should read, not `form`: the
+    cardano-cli forms sign the challenge TRANSACTION BODY HASH and the CIP-30 form
+    signs a COSE Sig_structure, so `digest` describes only the former. Reporting
+    `digest` for a CIP-30 run would name 32 bytes nothing signed."""
+    record = {"proved": False, "form": None, "digest": digest.hex(),
+              "signed_message": "challenge-tx-body-hash"}
+    if proof_path and not skey_path:
+        with open(proof_path) as fh:
+            head = fh.read(4096).lstrip()
+        if head.startswith("{"):
+            try:
+                doc = json.loads(open(proof_path).read())
+            except json.JSONDecodeError as exc:
+                raise CeremonyError(f"{proof_path} is not a readable JSON envelope: {exc}")
+            # EXACT equality, never a substring: an envelope typed
+            # "CIP30PossessionProof TxWitness" must not be able to match two branches
+            # and have the recorded form depend on which one this file checks first.
+            if isinstance(doc, dict) and doc.get("type") == CIP30_PROOF_TYPE:
+                if not my_address:
+                    raise CeremonyError(
+                        "a CIP-30 proof needs --my-address <your bech32 wallet>. Without it "
+                        "this tool can only establish that SOMEBODY holding "
+                        f"{owner_vkh} signed — and whoever chose that parameter can arrange "
+                        "exactly that with their own wallet. Naming your address is what "
+                        "makes the proof about YOU")
+                if expected_payload is None:
+                    raise CeremonyError(
+                        "a CIP-30 proof can only be judged against the message this ceremony "
+                        "demands, and this run did not produce one")
+                vkey, address, payload = verify_cip30_proof(
+                    doc, proof_path, owner_vkh, my_address, network, challenge,
+                    expected_payload, payout_address)
+                record.update(proved=True, form="cip30-signdata",
+                              signed_message="cose-sig-structure", digest=None,
+                              address=address, verification_key=vkey.hex(),
+                              verification_key_hash=vkh(vkey),
+                              payload=payload.decode("utf-8", "replace"))
+                return record
+    # Only the CIP-30 branch above reads --my-address. Reaching here with it set means
+    # the flag would be consumed and ignored, leaving a client who supplied the one
+    # input only they can supply believing a check ran that did not. The cardano-cli
+    # forms bind nothing but vkh(vkey) == client_owner_vkh, and client_owner_vkh is a
+    # parameter the OPERATOR writes — so silence there is the worst place for it.
+    if my_address:
+        raise CeremonyError(
+            "--my-address is only checked for a CIP-30 wallet proof, and this proof is not "
+            "one. Rather than accept the flag and ignore it, this refuses: a cardano-cli "
+            "witness or a detached signature establishes only that SOMEBODY holds "
+            f"{owner_vkh}, and nothing about whether that somebody is you. Drop "
+            "--my-address if you meant to use this form.")
     if skey_path:
         derived = vkh_from_skey_file(skey_path, cli)
         if derived != owner_vkh:
@@ -1533,6 +2007,12 @@ def main(argv=None):
                              "nothing about who holds it; it is required alongside a "
                              "detached --possession-proof, which needs the public half "
                              "to check the signature against")
+    parser.add_argument("--my-address", metavar="BECH32",
+                        help="the wallet address you signed a CIP-30 proof with. Required "
+                             "for that form and checked against the proof, the ceremony's "
+                             "payout address and the key that signed — it is the one input "
+                             "only you can supply, and a bech32 address is something you "
+                             "can recognise as yours where a 56-hex key hash is not")
     parser.add_argument("--possession-proof", metavar="FILE",
                         help="a signature by YOUR escape-hatch key over this "
                              "ceremony's challenge — the check that catches a swapped "
@@ -1814,9 +2294,21 @@ def main(argv=None):
                 json.dump(challenge_tx_envelope(challenge), fh, indent=4)
                 fh.write("\n")
 
+        # The band is what a client reads back in the wallet popup, so the payload
+        # carries it in the same human units the report prints.
+        payload_band = (
+            f"{band['bid_ceiling_ada_per_display_unit']} - "
+            f"{band['ask_floor_ada_per_display_unit']} ADA per token" if band else None)
+        expected_payload = (canonical_possession_payload(
+            challenge, args.network, params, payload_band).encode() if payload_band else None)
+        result["possession_payload"] = expected_payload.decode() if expected_payload else None
+
         possession = check_possession(
             owner, digest, args.possession_proof, args.my_skey_file,
-            args.my_vkey_file, shlex.split(args.cardano_cli))
+            args.my_vkey_file, shlex.split(args.cardano_cli),
+            my_address=args.my_address, network=args.network, challenge=challenge,
+            expected_payload=expected_payload,
+            payout_address=params["client_payout_address"])
         result["possession"] = possession
         checks["key_hash_matches_your_file"] = bool(args.my_vkey_file)
         checks["key_possession_proved"] = possession["proved"]
