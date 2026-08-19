@@ -208,10 +208,12 @@ def _enc(v):
     raise TypeError(v)
 
 
-def _datum(fx, beacon=None, a1=MIN_A1, a2=MIN_A2):
+def _datum(fx, beacon=None, a1=MIN_A1, a2=MIN_A2, asset1=(b"", b""), asset2=(TOK_POL, TOK_NAME),
+           pair_beacon=PB, asset1_beacon=A1B, asset2_beacon=A2B):
     rat = lambda n, d: ("tag", 121, [n, d])
     none = ("tag", 122, [])
-    fields = [beacon or fx.beacon, PB, b"", b"", A1B, TOK_POL, TOK_NAME, A2B, rat(*a1), rat(*a2), none, none]
+    fields = [beacon or fx.beacon, pair_beacon, asset1[0], asset1[1], asset1_beacon,
+              asset2[0], asset2[1], asset2_beacon, rat(*a1), rat(*a2), none, none]
     return _enc(("tag", 121, fields))
 
 
@@ -232,7 +234,7 @@ def _change_out(fx, raw=None, lovelace=5000000):
     return {0: raw if raw is not None else vc.bech32_decode(fx.fund)[1], 1: [lovelace, {}]}
 
 
-def _body(fx, outputs, mint=None, fee=455329, coll_return=None, total_collateral=682994):
+def _body(fx, outputs, mint=None, fee=455329, coll_return=None, total_collateral=682994, expect_pair=None):
     mint = mint if mint is not None else {fx.beacon: {PB: 1, A1B: 1, A2B: 1}}
     # A real create pledges collateral for the beacon mint's phase-2 script, so it carries collateral
     # inputs (13), a collateral return to the funder (16) and a bounded total_collateral (17). Model that
@@ -244,8 +246,11 @@ def _body(fx, outputs, mint=None, fee=455329, coll_return=None, total_collateral
     return body
 
 
-def _refusals(fx, body, max_fee=5_000_000):
-    return vcb.verify_body(body, fx.ceremony, fx.fund, max_fee)[0]
+DEFAULT_PAIR = (("", ""), (TOK_POL.hex(), TOK_NAME.hex()))
+
+
+def _refusals(fx, body, max_fee=5_000_000, expect_pair=None):
+    return vcb.verify_body(body, fx.ceremony, fx.fund, max_fee, expect_pair or DEFAULT_PAIR)[0]
 
 
 def _only(refusals, *needles):
@@ -269,12 +274,13 @@ def _run_cli(fx, body_path, extra=()):
     return subprocess.run(
         [sys.executable, os.path.join(HERE, "verify_create_body.py"),
          "--body", body_path, "--params", fx.params, "--fund-addr", fx.fund,
+         "--expect-pair", f".,{TOK_POL.hex()}.{TOK_NAME.hex()}",
          "--network", "testnet", "--aiken", _aiken(), "--project", fx.project, *extra],
         capture_output=True, text=True)
 
 
 def test_real_honest_body_verifies(fx):
-    refusals, assertions = vcb.verify_body(vcb.load_body(fx.honest), fx.ceremony, fx.fund, 5_000_000)
+    refusals, assertions = vcb.verify_body(vcb.load_body(fx.honest), fx.ceremony, fx.fund, 5_000_000, DEFAULT_PAIR)
     assert refusals == []
     assert assertions["asset2Price"] == "2700000/1"
     assert assertions["orderAddress"] == fx.ceremony["order_address"]
@@ -366,6 +372,119 @@ def test_wrong_beacon_id_in_datum_refused(fx):
     _only(_refusals(fx, body), "order datum:", "beacon policy")
 
 
+def test_extraneous_asset_in_order_output_refused(fx):
+    """The chain hard-errors on it, at phase 2, after the client has signed.
+
+    extract_ask_and_offer_quantity (two_way_swap/utils.ak) raises
+    `error @"No extraneous assets allowed in the UTxO"` for any policy that is not
+    beacon_id / ada / asset1_id / asset2_id. This gate exists to refuse before a
+    signature, so a body it blesses must not be one the validator rejects: the
+    client would forfeit their pledged collateral on a phase-2 failure.
+    """
+    junk_pol, junk_name = bytes.fromhex("ff" * 28), b"JUNK"
+    out = _order_out(fx, _datum(fx))
+    out[1][1][junk_pol] = {junk_name: 7}
+    _only(_refusals(fx, _body(fx, [out, _change_out(fx)])), "extraneous", junk_pol.hex())
+
+
+def test_extraneous_asset_name_under_the_token_policy_refused(fx):
+    """The validator matches the asset NAME too, not just the policy."""
+    out = _order_out(fx, _datum(fx))
+    out[1][1][TOK_POL][b"OTHER"] = 3
+    _only(_refusals(fx, _body(fx, [out, _change_out(fx)])), "extraneous")
+
+
+def test_order_holding_only_beacons_and_ada_is_allowed(fx):
+    """A pure ADA bid seeds the buy side with no token, and the chain accepts it.
+
+    Asserting "no refusals" alone passes with the whole extraneous-asset hunk
+    deleted, so it is paired with the case the hunk exists to catch: the same body
+    plus one junk asset MUST be refused. Together they pin the boundary rather than
+    the absence of a check."""
+    out = _order_out(fx, _datum(fx))
+    del out[1][1][TOK_POL]
+    assert _refusals(fx, _body(fx, [out, _change_out(fx)])) == []
+
+    junk = bytes.fromhex("ee" * 28)
+    out[1][1][junk] = {b"X": 1}
+    _only(_refusals(fx, _body(fx, [out, _change_out(fx)])), "extraneous", junk.hex())
+
+
+def test_datum_declaring_a_foreign_asset2_is_refused(fx):
+    """The gate must not take the traded pair from the body it is auditing.
+
+    `traded` was read out of the datum's own asset1/asset2 fields, and nothing
+    upstream constrains those — so an operator declares whatever they want to park
+    as asset2 and the extraneous-asset check waves it through. The pair has to come
+    from the CLIENT, the same way --my-address is what makes a possession proof
+    about the client rather than about whoever wrote the params file.
+    """
+    junk = bytes.fromhex("ff" * 28)
+    out = _order_out(fx, _datum(fx, asset2=(junk, TOK_NAME)))
+    out[1][1][junk] = {TOK_NAME: 4}
+    del out[1][1][TOK_POL]
+    refusals = _refusals(fx, _body(fx, [out, _change_out(fx)]))
+    assert any("asset2" in r or "pair" in r for r in refusals), refusals
+
+
+def test_swapped_beacon_roles_are_refused(fx):
+    """expected_beacons was a SET read from the datum and only checked against the
+    holdings and the mint — all three of which the operator controls together. No
+    name was ever derived from the pair, so swapping the pair and asset1 beacons is
+    self-consistent and passed."""
+    datum = _datum(fx, pair_beacon=A1B, asset1_beacon=PB)
+    out = _order_out(fx, datum)
+    refusals = _refusals(fx, _body(fx, [out, _change_out(fx)]))
+    assert any("beacon" in r for r in refusals), refusals
+
+
+def test_same_policy_pair_is_not_reported_as_extraneous(fx):
+    """Two-way cardano-swaps supports a token/token pair under ONE policy. Keying
+    the traded map by policy id collapsed the two legs, so the gate refused the
+    asset1 leg the datum itself names."""
+    other = b"AAAA"
+    datum = _datum(fx, asset1=(TOK_POL, other))
+    out = _order_out(fx, datum)
+    out[1][1][TOK_POL] = {TOK_NAME: 4, other: 9}
+    refusals = _refusals(fx, _body(fx, [out, _change_out(fx)]), expect_pair=((TOK_POL.hex(), other.hex()), (TOK_POL.hex(), TOK_NAME.hex())))
+    assert not any("extraneous" in r for r in refusals), refusals
+
+
+def test_reference_script_on_the_order_output_refused(fx):
+    """A create must not park a reference script in the order output; the browser
+    mirror refuses it and the gate discarded output field 3 entirely."""
+    out = _order_out(fx, _datum(fx))
+    out[3] = vcb._Tag(24, b"\x01\x02")
+    _only(_refusals(fx, _body(fx, [out, _change_out(fx)])), "reference script")
+
+
+def test_datum_on_a_change_output_refused(fx):
+    """Change is plain value returning to the client; a datum on it means the value
+    is going somewhere with a script's rules attached."""
+    change = _change_out(fx)
+    change[2] = _inline(_datum(fx))
+    _only(_refusals(fx, _body(fx, [_order_out(fx, _datum(fx)), change])), "datum")
+
+
+def test_unsorted_pair_refused(fx):
+    """The validator requires asset1 < asset2; an unsorted datum can never validate,
+    so a gate that blesses it hands the client a create that dies on chain."""
+    pair = ((TOK_POL.hex(), TOK_NAME.hex()), ("", ""))
+    datum = _datum(fx, asset1=(TOK_POL, TOK_NAME), asset2=(b"", b""),
+                   asset1_beacon=A2B, asset2_beacon=A1B)
+    out = _order_out(fx, datum)
+    refusals = _refusals(fx, _body(fx, [out, _change_out(fx)]), expect_pair=pair)
+    assert any("sorted" in r for r in refusals), refusals
+
+
+def test_non_positive_traded_quantity_refused(fx):
+    """A zero-quantity entry is not admissible in a Conway output value at all, and a
+    negative one is not a holding — neither is something to bless into a signature."""
+    out = _order_out(fx, _datum(fx))
+    out[1][1][TOK_POL] = {TOK_NAME: 0}
+    _only(_refusals(fx, _body(fx, [out, _change_out(fx)])), "quantity")
+
+
 def test_high_fee_refused(fx):
     body = _body(fx, [_order_out(fx, _datum(fx)), _change_out(fx)], fee=6_000_000)
     _only(_refusals(fx, body), "fee is 6000000 lovelace, above")
@@ -443,7 +562,7 @@ def test_composite_body_key_refused(fx):
     body = _body(fx, [_order_out(fx, _datum(fx)), _change_out(fx)])
     body[("__tag__", 2, b"\x16")] = 4_194_304  # a bignum-tagged (composite) key
     with pytest.raises(vcb.Refusal):
-        vcb.verify_body(body, fx.ceremony, fx.fund, 5_000_000)
+        vcb.verify_body(body, fx.ceremony, fx.fund, 5_000_000, DEFAULT_PAIR)
 
 
 def test_duplicate_map_key_refused():

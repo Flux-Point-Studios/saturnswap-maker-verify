@@ -36,6 +36,7 @@
 #       --network testnet --witness your.skey --out-file client.witness [--testnet-magic 1] \
 #       [--sign-cli cardano-cli]
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -172,6 +173,36 @@ def parse_value(amount):
     raise Refusal("an output value is neither a coin nor a [coin, multiasset] pair")
 
 
+def pair_beacon_name(a1, a2):
+    """sha256 over both legs, ADA's empty policy substituted by 0x00 — the same
+    derivation the dApp's beacon policy and the browser guard compute."""
+    pid = lambda p: b"\x00" if p == "" else bytes.fromhex(p)
+    return hashlib.sha256(pid(a1[0]) + bytes.fromhex(a1[1]) + pid(a2[0]) + bytes.fromhex(a2[1])).hexdigest()
+
+
+def asset_beacon_name(asset):
+    return hashlib.sha256(bytes.fromhex(asset[0]) + bytes.fromhex(asset[1])).hexdigest()
+
+
+def parse_expect_pair(text):
+    """'.,policy.name' -> (("",""),(policy,name)). ADA is a bare dot."""
+    legs = text.split(",")
+    if len(legs) != 2:
+        raise Refusal("--expect-pair takes exactly two legs separated by a comma")
+    out = []
+    for leg in legs:
+        policy, _, name = leg.strip().partition(".")
+        if policy and len(policy) != 56:
+            raise Refusal(f"'{policy}' is not a 28-byte policy id")
+        for part in (policy, name):
+            if part and not all(c in "0123456789abcdefABCDEF" for c in part):
+                raise Refusal(f"'{part}' is not hex")
+        out.append((policy.lower(), name.lower()))
+    if out[0] == out[1]:
+        raise Refusal("the two legs of --expect-pair are the same asset")
+    return tuple(out)
+
+
 def parse_output(out):
     """(address_bytes, lovelace, assets, inline_datum_node_or_None). inline_datum_node is the
     DECODED Plutus Data, or None when the output has no inline datum."""
@@ -205,7 +236,12 @@ def parse_mint(mint):
 # list means the body is safe to witness.
 # ---------------------------------------------------------------------------
 
-def verify_body(body, ceremony, fund_bech32, max_fee):
+def verify_body(body, ceremony, fund_bech32, max_fee, expect_pair):
+    """`expect_pair` is ((asset1_policy, asset1_name), (asset2_policy, asset2_name)),
+    stated by the CLIENT. The ceremony's nine parameters do not name the traded pair,
+    so without it the pair checks would validate the body against its own datum — an
+    operator would simply declare whatever they wanted to park as asset2. This is the
+    same reason --my-address is mandatory for a CIP-30 possession proof."""
     refusals = []
     order_raw = vc.bech32_decode(ceremony["order_address"])[1]
     fund_raw = vc.bech32_decode(fund_bech32)[1]
@@ -244,7 +280,11 @@ def verify_body(body, ceremony, fund_bech32, max_fee):
         if bytes(addr) == order_raw:
             order_indexes.append((idx, out))
         elif bytes(addr) == fund_raw:
-            continue  # change back to the client's own wallet
+            # Change is plain value returning to you. A datum on it means the value
+            # leaves under a script's rules instead.
+            if inline is not None or (isinstance(out, dict) and out.get(2) is not None):
+                refusals.append(f"output {idx} returns to your wallet but carries a datum; change must be plain value")
+            continue
         else:
             refusals.append(
                 f"output {idx} pays {addr.hex()} — neither the ceremony order address nor your "
@@ -302,6 +342,8 @@ def verify_body(body, ceremony, fund_bech32, max_fee):
     _, order_lovelace, order_assets, inline = parse_output(out)
     assertions["orderLovelace"] = order_lovelace
 
+    if isinstance(out, dict) and out.get(3) is not None:
+        refusals.append("the order output carries a reference script; a create parks no script in the order")
     if inline is None:
         refusals.append("the order output carries no inline datum, so it is an unspendable deposit, not an order")
         return refusals, assertions
@@ -333,14 +375,73 @@ def verify_body(body, ceremony, fund_bech32, max_fee):
             f"{ceremony['min_asset1_price'][0]}/{ceremony['min_asset1_price'][1]} — the seed would rest "
             f"as a free round-trip the first reprice cannot lift")
 
-    # The three pair beacons the datum names: pair (field 1), asset1 (field 4), asset2 (field 7).
-    expected_beacons = {fields[1]["bytes"], fields[4]["bytes"], fields[7]["bytes"]}
+    # The datum's pair must be the one YOU said you are funding. Read from the datum
+    # alone, every downstream pair check would be the body agreeing with itself.
+    a1_declared, a2_declared = expect_pair
+    datum_pair = ((fields[2]["bytes"], fields[3]["bytes"]), (fields[5]["bytes"], fields[6]["bytes"]))
+    if datum_pair != (a1_declared, a2_declared):
+        refusals.append(
+            f"the order datum trades {datum_pair[0][0]}.{datum_pair[0][1]} / "
+            f"{datum_pair[1][0]}.{datum_pair[1][1]}, not the pair you declared — refusing to judge "
+            f"a body against its own claim about what it trades")
+        return refusals, assertions
+
+    # The validator requires the pair SORTED (asset1 < asset2); an unsorted datum can
+    # never validate, so blessing it hands the client a create that dies on chain.
+    def _sort_key(asset):
+        return (b"\x00" if asset[0] == "" else bytes.fromhex(asset[0]), bytes.fromhex(asset[1]))
+    if _sort_key(a1_declared) >= _sort_key(a2_declared):
+        refusals.append(
+            "the declared pair is not sorted (asset1 must sort before asset2); the validator refuses an "
+            "unsorted pair, so this create could never validate")
+
+    # DERIVED from the pair, never read from the datum: the dApp's beacon policy
+    # computes these names, so a datum naming a different triple fails on chain even
+    # when its holdings and its mint agree with it.
+    expected_beacons = {pair_beacon_name(a1_declared, a2_declared),
+                        asset_beacon_name(a1_declared), asset_beacon_name(a2_declared)}
+    for index, expected in ((1, pair_beacon_name(a1_declared, a2_declared)),
+                            (4, asset_beacon_name(a1_declared)),
+                            (7, asset_beacon_name(a2_declared))):
+        if fields[index]["bytes"] != expected:
+            refusals.append(
+                f"the order datum names beacon {fields[index]['bytes']} where the pair derives "
+                f"{expected}; the validator computes these names, so this create fails on chain")
     assertions["beacons"] = sorted(expected_beacons)
     held = order_assets.get(beacon_id, {})
     if {n: q for n, q in held.items()} != {n: 1 for n in expected_beacons}:
         refusals.append(
             f"the order output does not hold exactly the three pair beacons its datum names under "
             f"{beacon_id}; it holds {held}")
+
+    # The two-way validator's extract_ask_and_offer_quantity raises
+    # `error @"No extraneous assets allowed in the UTxO"` for anything that is not the
+    # beacon policy, ada, or one of the two traded assets — by NAME, not just policy.
+    # That is a phase-2 failure: it strikes after the client signed, forfeiting their
+    # pledged collateral. A gate that runs before the signature must refuse it here.
+    # A SET of (policy, name): a token/token pair under ONE policy is legitimate
+    # two-way shape, and a dict keyed by policy collapsed its two legs.
+    traded = {a1_declared, a2_declared}
+    traded_policies = {p for p, _ in traded}
+    for policy, names in sorted(order_assets.items()):
+        if policy == beacon_id:
+            continue
+        if policy not in traded_policies:
+            refusals.append(
+                f"the order output carries {policy}, which is neither a beacon nor one of the two "
+                f"assets its datum trades — the validator refuses extraneous assets, so this create "
+                f"fails ON CHAIN after you sign it and forfeits your collateral")
+            continue
+        for name, qty in sorted(names.items()):
+            if not isinstance(qty, int) or qty <= 0:
+                refusals.append(
+                    f"the order output declares {policy}.{name} with quantity {qty}; a Conway output value "
+                    f"admits only positive quantities, so this body cannot be submitted as written")
+            if (policy, name) not in traded:
+                refusals.append(
+                    f"the order output carries {policy}.{name}, an extraneous asset name under a traded "
+                    f"policy — the validator matches the name too, so this create fails ON CHAIN after "
+                    f"you sign it and forfeits your collateral")
 
     mint = parse_mint(body.get(9))
     if set(mint) != {beacon_id} or mint.get(beacon_id) != {n: 1 for n in expected_beacons}:
@@ -358,7 +459,7 @@ def run(args):
     workdir = tempfile.mkdtemp(prefix="mmaas-create-verify-")
     ceremony = derive_ceremony(args.params, args.network, args.project, args.aiken, workdir)
     body = load_body(args.body)
-    refusals, assertions = verify_body(body, ceremony, args.fund_addr, args.max_fee_lovelace)
+    refusals, assertions = verify_body(body, ceremony, args.fund_addr, args.max_fee_lovelace, parse_expect_pair(args.expect_pair))
     return refusals, assertions
 
 
@@ -373,6 +474,10 @@ def main(argv=None):
     parser.add_argument("--project", default=os.path.dirname(os.path.abspath(__file__)),
                         help="the maker_stake aiken project directory")
     parser.add_argument("--aiken", default=os.environ.get("AIKEN") or "aiken")
+    parser.add_argument("--expect-pair", required=True, metavar="A1,A2",
+                        help="the pair YOU are funding, as policy.name,policy.name (ADA is a bare dot). "
+                             "The ceremony does not name the pair, so without this the pair checks would "
+                             "only confirm the body agrees with itself")
     parser.add_argument("--max-fee-lovelace", type=int, default=5_000_000,
                         help="refuse a body whose fee exceeds this (default 5 ADA)")
     parser.add_argument("--json-out", help="also write the machine-readable result here")
