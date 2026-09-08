@@ -1052,7 +1052,7 @@ class SourceIntegrity(unittest.TestCase):
 
     def _tampered_project(self, tmp, mutate):
         proj = os.path.join(tmp, "maker_stake")
-        shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal"))
+        shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal", ".git"))
         bp = os.path.join(proj, "plutus.json")
         with open(bp) as fh:
             doc = json.load(fh)
@@ -1096,7 +1096,7 @@ class SourceIntegrity(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="mmaas-dirty-")
         try:
             proj = os.path.join(tmp, "maker_stake")
-            shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal"))
+            shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal", ".git"))
             for args in (["init", "-q"], ["add", "-A"],
                          ["-c", "user.email=t@t", "-c", "user.name=t",
                           "commit", "-q", "-m", "baseline"]):

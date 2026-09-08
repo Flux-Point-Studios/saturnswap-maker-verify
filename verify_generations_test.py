@@ -12,13 +12,15 @@ HISTORICAL_ORDER = (
 )
 HISTORICAL_REWARD = "stake_test17pf8my3964mlh6pvl8davyfhn4wyn7nd3gtpp3lxtrmkwqq2507cr"
 
+HISTORICAL_PROOF = bytes.fromhex('831dc5939dd7b6eac6deec8793796acfc6e27684dfe86e6e81eec8ab5594be2ae1a40ba8686109c1eda9a5199e81e3c70f186017c03d6be708d3433ea265ca0f')
+
 class Generations(unittest.TestCase):
     def test_historical_source_rebuilds_the_original_ceremony(self):
         rc, out, err, doc = run_tool(
             GOLDEN_PARAMS, project=os.path.join(HERE, "generations", HISTORICAL_HASH),
-            extra=["--derive-only", "--expect-script-hash", HISTORICAL_APPLIED,
+            extra=["--expect-script-hash", HISTORICAL_APPLIED,
                    "--expect-order-address", HISTORICAL_ORDER,
-                   "--expect-reward-address", HISTORICAL_REWARD], vkey=None, proof=None)
+                   "--expect-reward-address", HISTORICAL_REWARD], proof=HISTORICAL_PROOF)
         self.assertEqual(rc, 0, out + err)
         self.assertTrue(doc["source_integrity"]["ok"])
         self.assertEqual(doc["source_integrity"]["unapplied_script_hash"], HISTORICAL_HASH)
@@ -27,18 +29,16 @@ class Generations(unittest.TestCase):
 
     def test_current_source_cannot_verify_the_old_order_address(self):
         rc, out, err, doc = run_tool(
-            GOLDEN_PARAMS, extra=["--derive-only", "--expect-order-address", HISTORICAL_ORDER],
-            vkey=None, proof=None)
+            GOLDEN_PARAMS, extra=["--expect-order-address", HISTORICAL_ORDER])
         self.assertNotEqual(rc, 0, out + err)
-        self.assertIn("order", doc["error"].lower())
+        self.assertTrue(any(m["what"] == "order address" for m in doc["mismatches"]))
 
     def test_historical_source_cannot_verify_the_current_script(self):
         rc, out, err, doc = run_tool(
             GOLDEN_PARAMS, project=os.path.join(HERE, "generations", HISTORICAL_HASH),
-            extra=["--derive-only", "--expect-script-hash", GOLDEN_APPLIED_HASH],
-            vkey=None, proof=None)
+            extra=["--expect-script-hash", GOLDEN_APPLIED_HASH], proof=HISTORICAL_PROOF)
         self.assertNotEqual(rc, 0, out + err)
-        self.assertIn("hash", doc["error"].lower())
+        self.assertTrue(any("script hash" in m["what"] for m in doc["mismatches"]))
 
 if __name__ == "__main__":
     unittest.main()
