@@ -1,7 +1,12 @@
 # SaturnSwap MMaaS — verify your own ceremony
 
-This is the validator your market-making instance runs on, plus the tool that
+This repository publishes source generations for your market-making instance, plus the tool that
 checks it. It exists so you never have to take SaturnSwap's word for anything.
+
+**Check your generation first:** the root publishes `18d2246d…`; existing `adc2a7f1…`
+addresses use the retained historical source. See [Validator generations](GENERATIONS.md)
+for the source selector, exact pins, security differences, and migration requirements.
+
 
 Your liquidity rests at an address derived from nine parameters. Two are yours
 alone; five are ours to publish and yours to check; two are prices you set. Once

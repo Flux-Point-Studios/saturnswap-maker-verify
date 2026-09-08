@@ -562,8 +562,16 @@ if owed:
     sys.exit(4)
 PY
 else
-  echo "  note: could not read the reward balance for $REWARD_ADDR; if this credential"
-  echo "  has unclaimed rewards, the withdraw-0 every round uses will not build."
+  echo "REFUSING: could not read the reward balance for $REWARD_ADDR." >&2
+  echo "  An unreadable balance is not a balance of zero. Every round here withdraws +0" >&2
+  echo "  to run the bound script, and the ledger only accepts a withdrawal that drains" >&2
+  echo "  the whole balance — so if this credential has accrued anything, every round" >&2
+  echo "  fails phase 1 with no diagnosis at all. Proceeding on a guess is how a client" >&2
+  echo "  ends up staring at that. Point --cardano-cli at a reachable node and re-run;" >&2
+  echo "  if you are certain the balance is zero, ESCAPE_ASSUME_NO_REWARDS=1 says so" >&2
+  echo "  explicitly. Nothing was submitted." >&2
+  [ "${ESCAPE_ASSUME_NO_REWARDS:-0}" = 1 ] || exit 4
+  echo "  ESCAPE_ASSUME_NO_REWARDS=1 — proceeding on your word." >&2
 fi
 
 # 2. plan the recovery against the protocol's own limits

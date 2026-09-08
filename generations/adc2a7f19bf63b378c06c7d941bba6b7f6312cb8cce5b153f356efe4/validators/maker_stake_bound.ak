@@ -44,8 +44,7 @@ use cardano/certificate.{
 }
 use cardano/script_context.{ScriptContext}
 use cardano/transaction.{
-  Datum, InlineDatum, Input, NoDatum, Output, OutputReference, Transaction,
-  placeholder,
+  InlineDatum, Input, NoDatum, Output, OutputReference, Transaction, placeholder,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,48 +114,16 @@ fn rational_positive(r: LegacyRational) -> Bool {
 // UTxO nobody can spend, or reprice a leg to dust so a colluding filler drains
 // the inventory through the public TakeAsset path (conservation alone can't
 // see a dust reprice: the value never leaves the order address).
-/// The trading pair a swap datum declares, or `None` when the datum is not one.
-///
-/// ⚠️ THE CEREMONY FLOORS CARRY NO ASSET. `min_asset1_price` and
-/// `min_asset2_price` are bare rationals; the datum is what says which pair they
-/// price. Without this, a bot holding only its own key could re-declare a
-/// client's order against a token it minted for nothing, quote AT both of the
-/// client's own floors, and conserve every asset — the value does not move in
-/// that transaction at all. The theft is a later permissionless TAKER fill,
-/// which never invokes this validator, so neither conservation nor the floors
-/// can see it. Proven executably: `bot_repair_to_foreign_pair_rejected` and
-/// `bot_split_repair_rejected`.
-fn declared_pair(
-  datum: Datum,
-) -> Option<(PolicyId, AssetName, PolicyId, AssetName)> {
-  when datum is {
-    InlineDatum(d) ->
-      if d is sd: LegacySwapDatum {
-        Some((sd.asset1_id, sd.asset1_name, sd.asset2_id, sd.asset2_name))
-      } else {
-        None
-      }
-    _ -> None
-  }
-}
-
 fn is_spendable_continuation_datum(
   output: Output,
   beacon_id: ScriptHash,
   min_asset1_price: LegacyRational,
   min_asset2_price: LegacyRational,
-  sanctioned_pair: Option<(PolicyId, AssetName, PolicyId, AssetName)>,
 ) -> Bool {
   when output.datum is {
     InlineDatum(d) ->
       if d is sd: LegacySwapDatum {
         and {
-          // The pair this continuation prices must be the pair that was spent.
-          // `None` — no order input, or order inputs that disagree — blesses
-          // nothing, so the bot cannot conjure a pair it did not carry in.
-          sanctioned_pair == Some(
-            (sd.asset1_id, sd.asset1_name, sd.asset2_id, sd.asset2_name),
-          ),
           sd.beacon_id == beacon_id,
           // Sign guard, self-contained: cross-multiplication in rational_geq is
           // only direction-preserving for positive rationals, and the dApp's
@@ -278,11 +245,8 @@ fn payout_bound(
   // can only accrue if the CLIENT delegates — `publish` denies the bot every
   // delegation certificate — and if they ever do, every builder in the stack
   // withdraws a hardcoded `+0`, which the ledger rejects once the balance is
-  // non-zero — so the fold is unreachable until that changes, which is exactly
-  // what task #379 is changing. It carries two guarantees: the yield is client
-  // value for conservation (`guarded_in` below), and it is NOT operator revenue
-  // (`fee_basis`, further down). A client who delegates cannot have the yield
-  // taken, and cannot be charged for it either.
+  // non-zero. So this fold is unreachable today by design, and stays here as
+  // the guarantee that a client who does delegate cannot have the yield taken.
   let rewards = list.foldl(
     self.withdrawals,
     0,
@@ -324,35 +288,6 @@ fn payout_bound(
     },
   )
 
-  // The pair the bot is allowed to write, taken from what it SPENT. A ceremony
-  // bounds one band, and a band is a statement about one pair — so a
-  // transaction that spends orders on two different pairs has no single
-  // sanctioned answer and blesses no continuation at all. Fails closed: the
-  // keeper batches per pair, which is what it already does.
-  let spent_pairs = list.foldl(
-    self.inputs,
-    [],
-    fn(input, acc) {
-      if is_order_address(input.output.address, dapp_hash, own_cred) {
-        when declared_pair(input.output.datum) is {
-          Some(p) -> [p, ..acc]
-          None -> acc
-        }
-      } else {
-        acc
-      }
-    },
-  )
-  let sanctioned_pair = when spent_pairs is {
-    [] -> None
-    [p, ..rest] ->
-      if list.all(rest, fn(q) { q == p }) {
-        Some(p)
-      } else {
-        None
-      }
-  }
-
   let allowed_out = list.foldl(
     self.outputs,
     assets.zero,
@@ -363,7 +298,6 @@ fn payout_bound(
           beacon_id,
           min_asset1_price,
           min_asset2_price,
-          sanctioned_pair,
         ) {
           assets.merge(acc, output.value)
         } else {
@@ -442,31 +376,10 @@ fn payout_bound(
     },
   )
 
-  // deci's rule, second reading: the operator is paid for RUNNING the position,
-  // and staking yield is not something the operator ran. `publish` only ever
-  // lets the CLIENT delegate, so every lovelace of `rewards` was produced by the
-  // client's own credential — and `payout_realized` cannot tell it apart from a
-  // realized gain, because both arrive as lovelace at `client_payout`.
-  //
-  // So the yield leaves the basis. Subtracted rather than forbidden outright: a
-  // transaction that harvests AND realizes a genuine trade may still be paid on
-  // the trade, and a blunt "no fee whenever rewards move" would only push the
-  // keeper into extra transactions and extra gas for no gain to the client.
-  //
-  // Clamped at zero because the subtraction is not a conservation statement:
-  // rewards can be routed into inventory rather than to the payout, and a
-  // negative basis must read as "nothing the operator earned", never as a
-  // credit against some other transaction's fee.
-  let fee_basis = if payout_realized > rewards {
-    payout_realized - rewards
-  } else {
-    0
-  }
-
   let fee_ok = and {
     fee_bps_param >= 0,
     fee_bps_param <= max_fee_bps,
-    fee_taken * 10_000 <= ( fee_basis + fee_taken ) * fee_bps_param,
+    fee_taken * 10_000 <= ( payout_realized + fee_taken ) * fee_bps_param,
     or {
       !closes_an_order,
       fee_taken == 0,
@@ -649,11 +562,8 @@ const bot_addr: Address =
 const other_addr: Address =
   Address { payment_credential: VerificationKey(other), stake_credential: None }
 
-/// The order fixture as the RECORD. Every variant below is built from this by
-/// field update, so none of them has to round-trip through `Data` and `expect`
-/// the record back out — the fixtures state what they are instead of asserting it.
-fn base_order_datum() -> LegacySwapDatum {
-  LegacySwapDatum {
+fn valid_order_datum() -> Data {
+  let d = LegacySwapDatum {
     beacon_id: beacon,
     pair_beacon: "PAIR",
     asset1_id: "",
@@ -674,22 +584,21 @@ fn base_order_datum() -> LegacySwapDatum {
     ),
     expiration: None,
   }
-}
-
-fn valid_order_datum() -> Data {
-  let data: Data = base_order_datum()
+  let data: Data = d
   data
 }
 
 fn wrong_beacon_datum() -> Data {
-  let data: Data = LegacySwapDatum { ..base_order_datum(), beacon_id: tkn }
+  expect sd: LegacySwapDatum = valid_order_datum()
+  let data: Data = LegacySwapDatum { ..sd, beacon_id: tkn }
   data
 }
 
 // valid_order_datum repriced to arbitrary asset1/asset2 prices.
 fn priced_datum(a1n: Int, a1d: Int, a2n: Int, a2d: Int) -> Data {
+  expect sd: LegacySwapDatum = valid_order_datum()
   let data: Data = LegacySwapDatum {
-    ..base_order_datum(),
+    ..sd,
     asset1_price: LegacyRational { numerator: a1n, denominator: a1d },
     asset2_price: LegacyRational { numerator: a2n, denominator: a2d },
   }
@@ -1244,114 +1153,6 @@ test fee_leg_within_the_bound_is_allowed() {
     [bot],
   )
   run_withdraw_fee(t)
-}
-
-/// deci's rule, second reading: the operator is paid for RUNNING the position,
-/// and staking yield is not something the operator ran. It is produced by the
-/// client's own delegation of their own credential — a delegation `publish`
-/// only ever lets the CLIENT make.
-///
-/// Without this the harvest is billable: withdraw R from the credential, route
-/// it to `client_payout`, and `payout_realized` counts it, so `fee_taken` is
-/// allowed fee_bps of the client's yield. No order is spent and no beacon is
-/// burned, so the `closes_an_order` clause never fires; the bot's signature is
-/// the only one needed. Bounded (0.2% of yield at the live fee_bps) and the
-/// client can always harvest fee-free themselves — but it is a fee on money the
-/// operator did not earn, and the ceremony's own copy says otherwise.
-test fee_on_harvested_yield_is_rejected() {
-  let t = tx(
-    [input_at(0, bot_addr, assets.from_lovelace(5_000_000))],
-    [
-      Output {
-        address: payout_addr,
-        value: assets.from_lovelace(98_000_000),
-        datum: NoDatum,
-        reference_script: None,
-      },
-      Output {
-        address: fee_addr,
-        value: assets.from_lovelace(2_000_000),
-        datum: NoDatum,
-        reference_script: None,
-      },
-    ],
-    [Pair(own_cred, 100_000_000)],
-    [bot],
-  )
-  !run_withdraw_fee(t)
-}
-
-/// ...and the client still gets their yield, in full, on the same shape without
-/// the fee leg. Removing the basis must not remove the harvest.
-test harvesting_yield_without_a_fee_is_allowed() {
-  let t = tx(
-    [input_at(0, bot_addr, assets.from_lovelace(5_000_000))],
-    [
-      Output {
-        address: payout_addr,
-        value: assets.from_lovelace(100_000_000),
-        datum: NoDatum,
-        reference_script: None,
-      },
-    ],
-    [Pair(own_cred, 100_000_000)],
-    [bot],
-  )
-  run_withdraw_fee(t)
-}
-
-/// The precise reading, not the blunt one: a transaction that harvests AND
-/// realizes a genuine trade may still be paid on the TRADE. Only the yield
-/// leaves the basis. A blunt "no fee whenever rewards move" would push the
-/// keeper into extra transactions and extra gas for no gain to the client.
-/// 89 ADA out, of which 40 is withdrawn yield -> the basis is 49, and at the
-/// fixture's 200 bps the ceiling is basis/49 = 1_000_000 exactly.
-test fee_on_the_trade_half_of_a_harvest_is_allowed() {
-  let t = tx(
-    [input_at(0, bot_addr, assets.from_lovelace(5_000_000))],
-    [
-      Output {
-        address: payout_addr,
-        value: assets.from_lovelace(89_000_000),
-        datum: NoDatum,
-        reference_script: None,
-      },
-      Output {
-        address: fee_addr,
-        value: assets.from_lovelace(1_000_000),
-        datum: NoDatum,
-        reference_script: None,
-      },
-    ],
-    [Pair(own_cred, 40_000_000)],
-    [bot],
-  )
-  run_withdraw_fee(t)
-}
-
-/// ...and one lovelace past that ceiling is refused, so the subtraction is a
-/// real bound and not a decoration.
-test fee_over_the_trade_half_of_a_harvest_is_rejected() {
-  let t = tx(
-    [input_at(0, bot_addr, assets.from_lovelace(5_000_000))],
-    [
-      Output {
-        address: payout_addr,
-        value: assets.from_lovelace(89_000_000),
-        datum: NoDatum,
-        reference_script: None,
-      },
-      Output {
-        address: fee_addr,
-        value: assets.from_lovelace(1_000_001),
-        datum: NoDatum,
-        reference_script: None,
-      },
-    ],
-    [Pair(own_cred, 40_000_000)],
-    [bot],
-  )
-  !run_withdraw_fee(t)
 }
 
 /// deci's rule. The same money, moving the same way, on a transaction that
@@ -2238,99 +2039,6 @@ test noncrossed_band_blocks_sequential_reprice_bypass() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// THE CEREMONY FLOORS CARRY NO ASSET. The bot writes the datum that says which
-// pair the two rationals price, and nothing here reads it back.
-//
-// `min_asset1_price` and `min_asset2_price` are bare rationals. The client
-// signed them meaning "0.09 ADA per NIGHT". A datum declaring the SAME numbers
-// against a token the bot minted for nothing means "0.09 ADA per JUNK", clears
-// both floors identically, and conserves every asset — the value does not move
-// in this transaction at all. The theft is a later, permissionless TAKER fill
-// that never invokes this validator, exactly as in the ladder drain.
-//
-// Junk pair: the SAME asset1 (ada) and a worthless asset2, so both floors are
-// compared against numbers that are no longer about the client's token.
-const junk: PolicyId =
-  #"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
-
-fn repaired_datum() -> Data {
-  let data: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    asset2_id: junk,
-    asset2_name: "JUNK",
-    // The beacon NAMES the bot declares for the new pair. cardano-swaps binds
-    // these to the asset ids; this validator never looks at them.
-    pair_beacon: "JUNKPAIR",
-    asset2_beacon: "JUNKA2",
-    // Quoted exactly ON both ceremony floors — the honest band, untouched.
-    asset1_price: honest_a1,
-    asset2_price: honest_a2,
-  }
-  data
-}
-
-// The bot re-pairs the client's order onto a worthless asset, quoting at the
-// client's own floors, conserving every asset. If this validates, the sentence
-// "the bot can never quote outside the band you set" is false: the band is
-// still enforced, and it is no longer a band on the client's token.
-test bot_repair_to_foreign_pair_rejected() {
-  !run_withdraw_with(
-    payout_addr,
-    dapp,
-    beacon,
-    honest_a1,
-    honest_a2,
-    tx(
-      [input_at(0, order_addr, inventory())],
-      [cont(inventory(), repaired_datum())],
-      [Pair(own_cred, 0)],
-      [bot],
-    ),
-  )
-}
-
-// The realistic shape, and the one that survives cardano-swaps: the bot SPLITS
-// the book. One continuation keeps the client's token as an honest order; the
-// other carries the ADA re-paired onto junk. Per-asset conservation is exact —
-// every lovelace and every TKN stays inside the perimeter — so `conserved`
-// cannot object, and each output clears both floors on its own.
-test bot_split_repair_rejected() {
-  let honest_half: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    asset1_price: honest_a1,
-    asset2_price: honest_a2,
-  }
-  !run_withdraw_with(
-    payout_addr,
-    dapp,
-    beacon,
-    honest_a1,
-    honest_a2,
-    tx(
-      [input_at(0, order_addr, inventory())],
-      [
-        // the client's TKN, still an honest ADA/TKN order
-        cont(
-          assets.from_lovelace(1_000_000)
-            |> assets.add(tkn, "TKN", 100)
-            |> assets.add(beacon, "A1", 1),
-          honest_half,
-        ),
-        // the client's ADA, now priced against a token worth nothing
-        cont(
-          assets.from_lovelace(1_000_000)
-            |> assets.add(beacon, "PAIR", 1)
-            |> assets.add(beacon, "A2", 1),
-          repaired_datum(),
-        ),
-      ],
-      [Pair(own_cred, 0)],
-      [bot],
-    ),
-  )
-}
-
 // A single crossed quote under an honest band, for completeness: bid 2.8 ADA
 // against ask 2.6 ADA breaches the bid ceiling.
 test bot_reprice_crossed_pair_rejected() {
@@ -2787,16 +2495,7 @@ test golden_two_way_datum_accepted_by_continuation_gate() {
     datum: InlineDatum(golden_two_way_datum()),
     reference_script: None,
   }
-  // The pair it declares is the pair it carries in, which is what a real reprice
-  // does; the gate now refuses a continuation that names any other.
-  let d = golden_two_way_datum()
-  is_spendable_continuation_datum(
-    output,
-    golden_beacon,
-    zero_floor,
-    zero_floor,
-    Some((d.asset1_id, d.asset1_name, d.asset2_id, d.asset2_name)),
-  )
+  is_spendable_continuation_datum(output, golden_beacon, zero_floor, zero_floor)
 }
 
 // ---------------------------------------------------------------------------

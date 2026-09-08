@@ -1,0 +1,18 @@
+name = "flux-point/maker_stake"
+version = "0.0.0"
+compiler = "v1.1.22"
+plutus = "v3"
+license = "Apache-2.0"
+description = "SaturnSwap Option C market-maker staking validator"
+
+[repository]
+user = "flux-point"
+project = "maker_stake"
+platform = "github"
+
+[[dependencies]]
+name = "aiken-lang/stdlib"
+version = "v3.1.0"
+source = "github"
+
+[config]

@@ -13,7 +13,7 @@
 #
 #   ./verify_project.sh          # install the pinned toolchain, run every gate
 #
-# Honours an already-correct `aiken` on PATH. Python dependencies go to a temp
+# Downloads and checksums the pinned Aiken release. Python dependencies go to a temp
 # directory on PYTHONPATH, never to site-packages — a --require-hashes install
 # still runs the package's own build code, and the suites it is installed FOR
 # are the ones that judge the validator.
@@ -21,7 +21,7 @@ set -euo pipefail
 
 # The base (unapplied) hash the validator source must compile to. A change here
 # re-parameterises every client ceremony, so it is pinned rather than trusted.
-EXPECTED_BOUND=adc2a7f19bf63b378c06c7d941bba6b7f6312cb8cce5b153f356efe4
+EXPECTED_BOUND=18d2246d8b552b9e462ec93dece5716a7154314680b3f326a854789d
 
 AIKEN_VERSION=v1.1.22
 AIKEN_SHA256=d443f9deab109fd75ae19e22f7dfce4cdd2f70b3f68c152a6a23db6bc1ea76e1
@@ -143,6 +143,9 @@ python3 -c 'import nacl.signing; print("PyNaCl", nacl.__version__)'
 gate "the ceremony verifier agrees with the built blueprint"
 python3 verify_ceremony_test.py
 
+gate "historical generation rebuild and address separation"
+python3 verify_generations_test.py
+
 gate "the create-body gate the client witnesses through"
 # The one pytest suite: its fixture generates keys, derives a ceremony and builds both
 # bodies once for 26 cases. -p no:cacheprovider keeps it from writing .pytest_cache into
@@ -165,5 +168,17 @@ echo "$CARDANO_SWAPS_SHA256  $WORK/cs-plutus.json" | sha256sum -c -
 # skip. This suite was red for ten cases without anyone noticing, because
 # nothing ran it; a skip would be the same silence wearing a green tick.
 CS_PLUTUS="$WORK/cs-plutus.json" ESCAPE_REQUIRE_BLUEPRINT=1 bash escape.test.sh
+
+gate "the escape suite fails when its applied-hash pin is wrong"
+negative=$(mktemp "$PWD/.escape-negative.XXXXXX.sh")
+sed 's/^APPLIED=.*/APPLIED=00000000000000000000000000000000000000000000000000000000/' escape.test.sh > "$negative"
+if CS_PLUTUS="$WORK/cs-plutus.json" ESCAPE_REQUIRE_BLUEPRINT=1 bash "$negative" > "$WORK/escape-negative.log" 2>&1; then
+  rm -f "$negative"
+  echo "escape suite accepted an intentionally incorrect hash pin" >&2
+  exit 1
+fi
+rm -f "$negative"
+grep -q 'FAIL bound.plutus really hashes to the applied credential' "$WORK/escape-negative.log"
+echo "incorrect pin was rejected by the suite"
 
 printf '\n\033[1;32mall gates passed\033[0m\n'

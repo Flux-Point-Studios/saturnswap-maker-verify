@@ -51,20 +51,26 @@ CROSSED_FLOORS = {
     "min_asset2_price": {"numerator": 2000000, "denominator": 1},
 }
 
-# Re-derived for the nine-parameter (Phase 1 A) validator. The PREVIOUS golden —
-# unapplied 6206e819…, applied 3227e143… — is the live preprod bound client, a
+# Re-derived AGAIN for the fee-basis change (G6, task #379): staking yield leaves
+# the fee basis, which moves fee_ok, which moves the applied-parameter surface,
+# which moves every hash below. Derived by running verify_ceremony.py --derive-only
+# over GOLDEN_PARAMS above — the same tool a client runs — never by hand-editing a
+# hash to match a failing test.
+#
+# The one before this was the nine-parameter (Phase 1 A) re-derivation. The one
+# before THAT — unapplied 6206e819…, applied 3227e143… — is the live preprod bound client, a
 # SEVEN-parameter instance. This tool rebuilds the validator from source, so it
 # verifies instances made from the source it ships with: a seven-parameter
 # ceremony must be checked out at a pre-A commit and verified with that tool.
 # That is a real operational constraint, stated rather than papered over, and the
 # refusal a client would hit is asserted below.
-GOLDEN_UNAPPLIED_HASH = "adc2a7f19bf63b378c06c7d941bba6b7f6312cb8cce5b153f356efe4"
-GOLDEN_APPLIED_HASH = "527d9225d577fbe82cf9dbd611379d5c49fa6d8a1610c7e658f76700"
+GOLDEN_UNAPPLIED_HASH = "18d2246d8b552b9e462ec93dece5716a7154314680b3f326a854789d"
+GOLDEN_APPLIED_HASH = "cb927890105ec125dfcdbad4f997a6ab04f4ff7f576dda96d30d2538"
 GOLDEN_ORDER_ADDR = (
-    "addr_test1xqge9z36cwm9akl3q04xhvek9cums7drdupgjl0nr3qfz76j0kfzt4thl05"
-    "ze7wm6cgn082uf8axmzskzrr7vk8hvuqqj724uz"
+    "addr_test1xqge9z36cwm9akl3q04xhvek9cums7drdupgjl0nr3qfz77tjfufq"
+    "yz7cyjalnd66nue0f4tqn607l6hdhdfd5cdy5uqw4cfjh"
 )
-GOLDEN_REWARD_ADDR = "stake_test17pf8my3964mlh6pvl8davyfhn4wyn7nd3gtpp3lxtrmkwqq2507cr"
+GOLDEN_REWARD_ADDR = "stake_test17r9ey7yszp0vzfwlekadf7vh564sfa8l0atkmk5k6vxj2wq6tu2xd"
 
 # What the live preprod client is actually bound to, from the ceremony artefact
 # at rehearsal/ceremony.3227e143.json.
@@ -149,13 +155,13 @@ OPERATOR_VKEY_ENVELOPE = {
 # signatures answer, so a change to the challenge rule invalidates them loudly.
 GOLDEN_POSSESSION_PROOFS = {
     # the rehearsal ceremony on testnet
-    "e161437783703421c60ac40fb71d54bc1c1718d48238a2df1952ae8231406c9a":
-        "831dc5939dd7b6eac6deec8793796acfc6e27684dfe86e6e81eec8ab5594be2a"
-        "e1a40ba8686109c1eda9a5199e81e3c70f186017c03d6be708d3433ea265ca0f",
+    "9c9baaa6cf4628a7087773d63a1c3433af7ac8188379c809162e8fe004b1407c":
+        "f6a2671d05cea9e72404a0a3b1892f0f2ea64cf05fe8251ad3c188db7d6dffc5"
+        "b127010d4a9fb0db476459a0108aa53d08c33bfd584b2855ed165f624a24630d",
     # the same nine parameters with both addresses re-encoded for mainnet
-    "3488a0cb8caa908175b3aec28f895e3d97768a57258b7bc6d8e2d781eb6af005":
-        "4fb2205dbc626079fe154cb6c2c81db858420afc1cfaf9cdc135bba3279d4451"
-        "6a1824623795f85cc6f5449b797f2a8e371e1e9871087cd6642df18f756d5a05",
+    "5c9aed1d2d960d3e693449418df4e0284da4e4df3b835c98077aaf656d9e88ce":
+        "80850b369c435aee33bee60c890ddf1eebcc4b3d1c36940cf64f16f547ec8f67"
+        "8a90ca14f58f79ba0a52d98c26a19cb462358e756391c77636352c2f19e35304",
 }
 
 
@@ -1046,7 +1052,7 @@ class SourceIntegrity(unittest.TestCase):
 
     def _tampered_project(self, tmp, mutate):
         proj = os.path.join(tmp, "maker_stake")
-        shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal"))
+        shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal", ".git"))
         bp = os.path.join(proj, "plutus.json")
         with open(bp) as fh:
             doc = json.load(fh)
@@ -1090,7 +1096,7 @@ class SourceIntegrity(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="mmaas-dirty-")
         try:
             proj = os.path.join(tmp, "maker_stake")
-            shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal"))
+            shutil.copytree(HERE, proj, ignore=shutil.ignore_patterns("rehearsal", ".git"))
             for args in (["init", "-q"], ["add", "-A"],
                          ["-c", "user.email=t@t", "-c", "user.name=t",
                           "commit", "-q", "-m", "baseline"]):
@@ -1907,11 +1913,23 @@ class PossessionChallenge(unittest.TestCase):
     has no other way to sign 32 chosen bytes."""
 
     def test_the_challenge_wire_format_is_pinned(self):
-        """The committed possession fixtures answer these exact bytes; a change to
-        the challenge rule must invalidate them loudly rather than silently."""
+        """The committed possession fixtures answer these exact bytes.
+
+        This catches more than a change to the challenge RULE, and that breadth is
+        the point: the digest is taken over the ceremony's applied validator, so
+        ANY change to the validator moves it and invalidates every committed
+        signature. That is what happened when `fee_ok` was fixed — a deliberate
+        change to the on-chain predicate, which re-hashed the script, which
+        re-keyed the challenge, which orphaned the proofs.
+
+        The wire FORMAT is pinned separately, by
+        test_the_challenge_transaction_is_what_build_raw_emits, over a synthetic
+        challenge. So: this test moving alone means the inputs changed and the
+        proofs must be re-minted; BOTH moving means the encoding rule changed and
+        nothing may be re-minted until that is understood."""
         self.assertEqual(
             challenge_for(GOLDEN_PARAMS).hex(),
-            "e161437783703421c60ac40fb71d54bc1c1718d48238a2df1952ae8231406c9a")
+            "9c9baaa6cf4628a7087773d63a1c3433af7ac8188379c809162e8fe004b1407c")
 
     def test_the_challenge_transaction_is_what_build_raw_emits(self):
         """Pinned against a real `cardano-cli conway transaction build-raw --tx-in

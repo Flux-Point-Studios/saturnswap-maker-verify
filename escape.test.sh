@@ -40,7 +40,19 @@ cat > "$WORK/params.json" <<'JSON'
   "fee_bps": 20
 }
 JSON
-APPLIED=527d9225d577fbe82cf9dbd611379d5c49fa6d8a1610c7e658f76700
+# The rehearsal ceremony's APPLIED script hash, pinned INDEPENDENTLY on purpose: the checks below
+# compare the escape hatch's own emitted bound.plutus against it, so deriving it from the same tool
+# that produced that file would make them tautological.
+#
+# ⚠️ It is one of FIVE places this repo writes down a fact derived from the validator, and every one
+# of them moves when the validator does. When `fee_ok` changed, four were updated and this was
+# missed — found only because something finally ran the gate. They are:
+#     escape.test.sh              APPLIED                (here)
+#     verify_project.sh           EXPECTED_BOUND         (the UNAPPLIED hash)
+#     verify_ceremony_test.py     GOLDEN_APPLIED_HASH, GOLDEN_UNAPPLIED_HASH, GOLDEN_REWARD_ADDR
+#     verify_ceremony_test.py     GOLDEN_POSSESSION_PROOFS  (signatures — must be RE-MINTED, not edited)
+#     verify_ceremony_test.py     the challenge pin in test_the_challenge_wire_format_is_pinned
+APPLIED=cb927890105ec125dfcdbad4f997a6ab04f4ff7f576dda96d30d2538
 DAPP=11928a3ac3b65edbf103ea6bb3362e39b879a36f02897df31c40917b
 BEACON=8a199a17ef4517215945aaf3c8c5204c60fd94d34c46d341e99c8fcf
 
@@ -610,7 +622,12 @@ case "$*" in
   *"query protocol-parameters"*)
     printf '{"maxTxSize":16384,"maxValueSize":5000,"maxTxExecutionUnits":{"memory":17500000,"steps":10000000000}}\n' > "${out:-/dev/stdout}";;
   *"query stake-address-info"*)
-    printf '[{"rewardAccountBalance":0}]\n' > "${out:-/dev/stdout}";;
+    # FAKE_REWARDS: a number = that balance; "fail" = the node is unreachable, which is the
+    # case the guard used to wave through with a note.
+    case "${FAKE_REWARDS:-0}" in
+      fail) exit 1;;
+      *) printf '[{"rewardAccountBalance":%s}]\n' "${FAKE_REWARDS:-0}" > "${out:-/dev/stdout}";;
+    esac;;
   *"transaction build"*)
     printf '{"type":"Unwitnessed Tx ConwayEra","description":"","cborHex":"84a0f5f6"}\n' > "${out:-/dev/stdout}";;
   *"debug transaction view"*)
@@ -673,6 +690,49 @@ fi
 grep -q "SyntaxError\|Traceback" "$FAKE/run.log" \
   && { fail=$((fail+1)); echo "FAIL escape.sh raised a python error: $(grep -m1 'SyntaxError\|Error' "$FAKE/run.log")"; } \
   || pass=$((pass+1))
+
+
+# --- the rewards guard: it must REFUSE, and it must not fail open --------------
+#
+# Every round withdraws +0 to run the bound script, and Conway only accepts a
+# withdrawal that drains the whole balance. So one accrued reward makes every
+# round unbuildable — with a bare phase-1 error and no diagnosis unless this
+# guard speaks first. A client who delegated is exactly the client who most
+# needs the answer, and the browser path cannot help them here at all.
+run_escape(){
+  ( export FAKECLI_OUT="$FAKE/out" FAKE_REWARDS="$1"
+    cd "$FAKE" && FAKE_CEREMONY=1 bash "$HERE/escape.sh" \
+      --params "$WORK/params.json" --cardano-swaps-plutus "$CS_PLUTUS" \
+      --project "$HERE" --network testnet --testnet-magic 1 \
+      --dest addr_test1vdestination --fund-addr addr_test1vfunding \
+      --signing-key /dev/null --cardano-cli "$FAKE/cardano-cli" \
+      --aiken "$AIKEN" --out-dir "$FAKE/work2" --build-only ) >"$FAKE/run.$2.log" 2>&1
+  rc=$?
+  echo $rc
+}
+
+rc_rewards=$(run_escape 1234567 rewards)
+check "an unclaimed reward balance REFUSES with exit 4" "$rc_rewards" 4
+# ...and refuses AT THE GUARD. Exit 4 alone is not proof: other failures downstream
+# exit 4 too, so deleting the guard's own sys.exit left this green. Pin the ordering
+# instead — nothing may be BUILT once the guard has spoken.
+grep -q "protocol limits:" "$FAKE/run.rewards.log" \
+  && { fail=$((fail+1)); echo "FAIL the guard printed but planning continued anyway"; } \
+  || pass=$((pass+1))
+grep -q "1234567 lovelace of unclaimed staking rewards" "$FAKE/run.rewards.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL the refusal does not name the amount owed"; }
+grep -qi "withdraw them first with your own key" "$FAKE/run.rewards.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL the refusal does not name the remedy"; }
+
+# An UNREADABLE balance is not a balance of zero. This used to print a note and
+# carry on, which delivers the client to the exact undiagnosable phase-1 failure
+# the guard exists to prevent — the same fail-open shape as a browser gate that
+# reads an indexer outage as "no rewards".
+rc_unreadable=$(run_escape fail unreadable)
+check "an UNREADABLE reward balance refuses too, not proceeds" "$rc_unreadable" 4
+
+rc_zero=$(run_escape 0 zero)
+check "a genuinely zero balance proceeds" "$rc_zero" 0
 
 echo "escape.test.sh: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
