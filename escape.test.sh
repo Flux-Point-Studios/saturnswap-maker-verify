@@ -52,7 +52,7 @@ JSON
 #     verify_ceremony_test.py     GOLDEN_APPLIED_HASH, GOLDEN_UNAPPLIED_HASH, GOLDEN_REWARD_ADDR
 #     verify_ceremony_test.py     GOLDEN_POSSESSION_PROOFS  (signatures — must be RE-MINTED, not edited)
 #     verify_ceremony_test.py     the challenge pin in test_the_challenge_wire_format_is_pinned
-APPLIED=3f699f24522ad436ff43dd0b03353a16d0ccca14163d0c0b358867b3
+APPLIED=cb927890105ec125dfcdbad4f997a6ab04f4ff7f576dda96d30d2538
 DAPP=11928a3ac3b65edbf103ea6bb3362e39b879a36f02897df31c40917b
 BEACON=8a199a17ef4517215945aaf3c8c5204c60fd94d34c46d341e99c8fcf
 
@@ -691,8 +691,6 @@ grep -q "SyntaxError\|Traceback" "$FAKE/run.log" \
   && { fail=$((fail+1)); echo "FAIL escape.sh raised a python error: $(grep -m1 'SyntaxError\|Error' "$FAKE/run.log")"; } \
   || pass=$((pass+1))
 
-echo "escape.test.sh: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
 
 # --- the rewards guard: it must REFUSE, and it must not fail open --------------
 #
@@ -736,3 +734,6 @@ check "an UNREADABLE reward balance refuses too, not proceeds" "$rc_unreadable" 
 
 rc_zero=$(run_escape 0 zero)
 check "a genuinely zero balance proceeds" "$rc_zero" 0
+
+echo "escape.test.sh: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

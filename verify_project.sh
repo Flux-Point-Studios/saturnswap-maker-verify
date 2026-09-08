@@ -169,4 +169,16 @@ echo "$CARDANO_SWAPS_SHA256  $WORK/cs-plutus.json" | sha256sum -c -
 # nothing ran it; a skip would be the same silence wearing a green tick.
 CS_PLUTUS="$WORK/cs-plutus.json" ESCAPE_REQUIRE_BLUEPRINT=1 bash escape.test.sh
 
+gate "the escape suite fails when its applied-hash pin is wrong"
+negative=$(mktemp "$PWD/.escape-negative.XXXXXX.sh")
+sed 's/^APPLIED=.*/APPLIED=00000000000000000000000000000000000000000000000000000000/' escape.test.sh > "$negative"
+if CS_PLUTUS="$WORK/cs-plutus.json" ESCAPE_REQUIRE_BLUEPRINT=1 bash "$negative" > "$WORK/escape-negative.log" 2>&1; then
+  rm -f "$negative"
+  echo "escape suite accepted an intentionally incorrect hash pin" >&2
+  exit 1
+fi
+rm -f "$negative"
+grep -q 'FAIL bound.plutus really hashes to the applied credential' "$WORK/escape-negative.log"
+echo "incorrect pin was rejected by the suite"
+
 printf '\n\033[1;32mall gates passed\033[0m\n'
