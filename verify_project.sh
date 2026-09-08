@@ -13,7 +13,7 @@
 #
 #   ./verify_project.sh          # install the pinned toolchain, run every gate
 #
-# Honours an already-correct `aiken` on PATH. Python dependencies go to a temp
+# Downloads and checksums the pinned Aiken release. Python dependencies go to a temp
 # directory on PYTHONPATH, never to site-packages — a --require-hashes install
 # still runs the package's own build code, and the suites it is installed FOR
 # are the ones that judge the validator.
@@ -21,7 +21,7 @@ set -euo pipefail
 
 # The base (unapplied) hash the validator source must compile to. A change here
 # re-parameterises every client ceremony, so it is pinned rather than trusted.
-EXPECTED_BOUND=adc2a7f19bf63b378c06c7d941bba6b7f6312cb8cce5b153f356efe4
+EXPECTED_BOUND=18d2246d8b552b9e462ec93dece5716a7154314680b3f326a854789d
 
 AIKEN_VERSION=v1.1.22
 AIKEN_SHA256=d443f9deab109fd75ae19e22f7dfce4cdd2f70b3f68c152a6a23db6bc1ea76e1
@@ -142,6 +142,9 @@ python3 -c 'import nacl.signing; print("PyNaCl", nacl.__version__)'
 # able to run them, and their suites are held to the same bar.
 gate "the ceremony verifier agrees with the built blueprint"
 python3 verify_ceremony_test.py
+
+gate "historical generation rebuild and address separation"
+python3 verify_generations_test.py
 
 gate "the create-body gate the client witnesses through"
 # The one pytest suite: its fixture generates keys, derives a ceremony and builds both
