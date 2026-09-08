@@ -708,7 +708,6 @@ run_escape(){
       --signing-key /dev/null --cardano-cli "$FAKE/cardano-cli" \
       --aiken "$AIKEN" --out-dir "$FAKE/work2" --build-only ) >"$FAKE/run.$2.log" 2>&1
   rc=$?
-  cp "$FAKE/run.$2.log" "/tmp/esc.$2.log" 2>/dev/null || true
   echo $rc
 }
 
