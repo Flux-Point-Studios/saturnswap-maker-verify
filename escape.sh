@@ -47,6 +47,13 @@
 #             [--reference-scripts refs.json]
 set -uo pipefail
 
+# Resolve the verifier from THIS script's own directory, never from --project.
+# The published recovery selector `--project generations/<applied_hash>`
+# deliberately ships no verify_ceremony.py copy, so reading it from $project made
+# the documented generation selector die on a missing file. escape.sh and
+# verify_ceremony.py always ship together.
+ESCAPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # blake2b-224 over (version byte ‖ the compiled code a .plutus envelope wraps once). Args: file version(2|3).
 script_hash(){ python3 - "$1" "$2" <<'PY'
 import json, hashlib, sys
@@ -84,7 +91,7 @@ rebuild_and_verify_scripts(){
   #
   # The refusal is REPORTED. Discarding it here once made a nine-parameter tool
   # reading a seven-parameter file look like an unexplained "could not derive".
-  if ! python3 "$project/verify_ceremony.py" --params "$params" --network "$network" \
+  if ! python3 "$ESCAPE_DIR/verify_ceremony.py" --params "$params" --network "$network" \
     --project "$project" --aiken "$aiken" --for-escape --decimals 0 \
     --emit-applied-script "$work/bound.plutus" --json-out "$work/artefact.json" \
     >"$work/verify.out" 2>"$work/verify.err"; then
@@ -547,10 +554,30 @@ echo "order address: $ORDER_ADDR"
 # delegated is exactly the client who most needs a clear answer here.
 if $CLI conway query stake-address-info --address "$REWARD_ADDR" $MAGIC \
      --out-file "$WORK/reward.json" 2>/dev/null; then
-  python3 - "$WORK/reward.json" "$REWARD_ADDR" <<'PY' || exit 4
+  python3 - "$WORK/reward.json" "$REWARD_ADDR" "$APPLIED_HASH" <<'PY' || exit $?
 import json, sys
 info = json.load(open(sys.argv[1]))
 rows = info if isinstance(info, list) else [info]
+# Positive control against generation drift. A funded book's bound stake credential
+# is ALWAYS registered — an unregistered script stake credential cannot authorise
+# the withdraw-0 and so bricks the orders. An empty stake-address-info therefore
+# proves this is NOT the credential holding the funds, almost always because the
+# ceremony ran on an EARLIER validator generation than the source this checkout
+# rebuilds from. The parameters can be right and the source tree still wrong, so
+# recovery must refuse HERE rather than query a wrong-but-plausible order address
+# and report the false "nothing to recover".
+# An unregistered credential is an empty list; a cardano-cli that answers with a
+# single empty object counts the same, so treat any all-empty response as unregistered.
+if not rows or all(not r for r in rows):
+    sys.stderr.write(
+        f"REFUSING: {sys.argv[2]} is not a registered stake credential on this network,\n"
+        "  so it is not the credential holding the funds. A funded book's bound credential\n"
+        "  is always registered; an unregistered derivation means this checkout rebuilt a\n"
+        f"  DIFFERENT validator generation (applied hash {sys.argv[3]}) than the one behind\n"
+        "  the funded book. The parameters may be right; the source tree is wrong. Recover\n"
+        "  with the matching generation from the saturnswap-maker-verify repo: see its\n"
+        "  GENERATIONS.md and pass --project generations/<applied_hash>. Nothing was submitted.\n")
+    sys.exit(3)
 owed = sum(int(r.get("rewardAccountBalance") or 0) for r in rows)
 if owed:
     sys.stderr.write(
