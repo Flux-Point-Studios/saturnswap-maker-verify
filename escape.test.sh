@@ -626,6 +626,8 @@ case "$*" in
     # case the guard used to wave through with a note.
     case "${FAKE_REWARDS:-0}" in
       fail) exit 1;;
+      unregistered) printf '[]\n' > "${out:-/dev/stdout}";;
+      emptyobj) printf '[{}]\n' > "${out:-/dev/stdout}";;
       *) printf '[{"rewardAccountBalance":%s}]\n' "${FAKE_REWARDS:-0}" > "${out:-/dev/stdout}";;
     esac;;
   *"transaction build"*)
@@ -733,6 +735,23 @@ check "an UNREADABLE reward balance refuses too, not proceeds" "$rc_unreadable" 
 
 rc_zero=$(run_escape 0 zero)
 check "a genuinely zero balance proceeds" "$rc_zero" 0
+
+# Positive control (B4): an UNREGISTERED bound credential is proof this checkout
+# derived the WRONG generation — the funded book's credential is always registered.
+# It must refuse as generation drift (exit 3) and name the remedy, never fall
+# through to the recovery loop's false "nothing to recover".
+rc_unreg=$(run_escape unregistered unregistered)
+check "an UNREGISTERED credential refuses as generation drift (exit 3)" "$rc_unreg" 3
+grep -qi "not a registered stake credential" "$FAKE/run.unregistered.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL unregistered refusal not shown"; }
+grep -qF "GENERATIONS.md" "$FAKE/run.unregistered.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL refusal does not name the generation remedy"; }
+grep -qi "nothing to recover" "$FAKE/run.unregistered.log" \
+  && { fail=$((fail+1)); echo "FAIL fell through to the false 'nothing to recover'"; } \
+  || pass=$((pass+1))
+# a cardano-cli that answers unregistered with a single empty object, not [], refuses too
+rc_emptyobj=$(run_escape emptyobj emptyobj)
+check "an all-empty [{}] stake-address-info also refuses as drift (exit 3)" "$rc_emptyobj" 3
 
 echo "escape.test.sh: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
