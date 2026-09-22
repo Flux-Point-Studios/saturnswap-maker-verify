@@ -3,9 +3,11 @@
 This repository publishes source generations for your market-making instance, plus the tool that
 checks it. It exists so you never have to take SaturnSwap's word for anything.
 
-**Check your generation first:** the root publishes `18d2246d…`; existing `adc2a7f1…`
-addresses use the retained historical source. See [Validator generations](GENERATIONS.md)
-for the source selector, exact pins, security differences, and migration requirements.
+**Check your generation first.** The repository root publishes the current source generation;
+every generation it has ever published is retained under `generations/`. Which one YOUR address
+was built on is decided by your credential, not by which is newest, so read
+[Validator generations](GENERATIONS.md) — it lists every published generation with the source
+selector, exact pins, security differences, and migration requirements.
 
 
 Your liquidity rests at an address derived from nine parameters. Two are yours

@@ -88,6 +88,22 @@ class Generations(unittest.TestCase):
         self.assertEqual(listed, on_disk | {CURRENT_HASH},
                          "GENERATIONS.md does not list exactly the generations this repo ships")
 
+    # ⚠️ ONE LIST, IN ONE FILE. README.md is the front door and it named a specific generation as
+    # "the root" — so when the root moved, the first thing a client read told them their generation
+    # was not published here at all. A second copy of a list is a copy that goes stale silently;
+    # the README points at GENERATIONS.md instead, and this keeps it that way.
+    def test_the_readme_does_not_keep_its_own_copy_of_the_generation_list(self):
+        with open(os.path.join(HERE, "README.md")) as fh:
+            readme = fh.read()
+        # Only GENERATION hashes. The README legitimately carries the five operator constants a
+        # client checks (adam_bot_pkh, the dapp hash and so on), which are also 56 hex characters —
+        # a blanket "no hex" rule would fight the page's actual job.
+        known = set(HISTORICAL) | {CURRENT_HASH}
+        stray = sorted(g for g in known
+                       if g in readme or any(g.startswith(t) for t in re.findall(r"`([0-9a-f]{6,})…`", readme)))
+        self.assertEqual(stray, [],
+                         "README.md names a generation; GENERATIONS.md is the only list")
+
 
 if __name__ == "__main__":
     unittest.main()
