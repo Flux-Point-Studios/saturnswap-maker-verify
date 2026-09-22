@@ -552,8 +552,12 @@ echo "order address: $ORDER_ADDR"
 # no diagnosis. `publish` deliberately leaves delegation client-signable, so this
 # is an ordinary permitted action rather than an unreachable one, and a client who
 # delegated is exactly the client who most needs a clear answer here.
+# Whether the registration positive control below actually ran. It is the only check that
+# catches generation drift, and it needs a reward balance this tool may fail to read.
+DRIFT_CHECKED=0
 if $CLI conway query stake-address-info --address "$REWARD_ADDR" $MAGIC \
      --out-file "$WORK/reward.json" 2>/dev/null; then
+  DRIFT_CHECKED=1
   python3 - "$WORK/reward.json" "$REWARD_ADDR" "$APPLIED_HASH" <<'PY' || exit $?
 import json, sys
 info = json.load(open(sys.argv[1]))
@@ -575,8 +579,11 @@ if not rows or all(not r for r in rows):
         "  is always registered; an unregistered derivation means this checkout rebuilt a\n"
         f"  DIFFERENT validator generation (applied hash {sys.argv[3]}) than the one behind\n"
         "  the funded book. The parameters may be right; the source tree is wrong. Recover\n"
-        "  with the matching generation from the saturnswap-maker-verify repo: see its\n"
-        "  GENERATIONS.md and pass --project generations/<applied_hash>. Nothing was submitted.\n")
+        "  with the matching generation from the saturnswap-maker-verify repo: its\n"
+        "  GENERATIONS.md lists every published SOURCE generation, and each is a directory\n"
+        "  named after that source hash — not after the applied hash above, which is the one\n"
+        "  this wrong tree just derived. Try them with --project generations/<source hash>\n"
+        "  until the credential registers. Nothing was submitted.\n")
     sys.exit(3)
 owed = sum(int(r.get("rewardAccountBalance") or 0) for r in rows)
 if owed:
@@ -599,6 +606,12 @@ else
   echo "  explicitly. Nothing was submitted." >&2
   [ "${ESCAPE_ASSUME_NO_REWARDS:-0}" = 1 ] || exit 4
   echo "  ESCAPE_ASSUME_NO_REWARDS=1 — proceeding on your word." >&2
+  # ⚠️ AND THE GENERATION WENT UNCHECKED WITH IT. The registration positive control is the
+  # only thing that catches a wrong source tree, and it reads the very balance that just
+  # failed to load — so this flag waives rewards AND drift together, which its name does not
+  # say. An empty order address below is then indistinguishable from a book that is simply
+  # somewhere else, so it is reported as unproven rather than as nothing.
+  echo "  ⚠️ the generation-drift control could not run either: it reads the same balance." >&2
 fi
 
 # 2. plan the recovery against the protocol's own limits
@@ -690,6 +703,16 @@ while :; do
   python3 -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])) else 9)" "$WORK/order.json"
   case $? in
     9) [ "$ROUND" -gt 0 ] && { echo "ESCAPE COMPLETE: the order address is empty"; exit 0; }
+       if [ "$DRIFT_CHECKED" != 1 ]; then
+         echo "UNPROVEN: $ORDER_ADDR holds no UTxOs, and the generation was never verified." >&2
+         echo "  The registration control that catches a wrong validator generation could not" >&2
+         echo "  run, because the reward balance it reads was unreadable and the run continued" >&2
+         echo "  on ESCAPE_ASSUME_NO_REWARDS=1. An empty address on a WRONG generation looks" >&2
+         echo "  exactly like this, so do NOT read it as 'the book is gone'. Point --cardano-cli" >&2
+         echo "  at a reachable node and re-run, or try each source generation in the" >&2
+         echo "  saturnswap-maker-verify GENERATIONS.md with --project. Nothing was submitted." >&2
+         exit 3
+       fi
        echo "nothing to recover: the order address holds no UTxOs" >&2; exit 4;;
     0) ;;
     *) exit 4;;

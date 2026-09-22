@@ -753,5 +753,30 @@ grep -qi "nothing to recover" "$FAKE/run.unregistered.log" \
 rc_emptyobj=$(run_escape emptyobj emptyobj)
 check "an all-empty [{}] stake-address-info also refuses as drift (exit 3)" "$rc_emptyobj" 3
 
+# ⚠️ ESCAPE_ASSUME_NO_REWARDS WAIVES THE DRIFT CONTROL TOO, because the registration check
+# reads the very balance that just failed to load — and the flag's name says nothing about
+# that. A client on the wrong generation who sets it then reaches an order address that is
+# empty BECAUSE IT IS THE WRONG ADDRESS, and used to be told "nothing to recover": the exact
+# false negative the registration control exists to prevent, reached through a documented flag.
+printf '{}\n' > "$FAKE/order.json"
+rc_unproven=$( ESCAPE_ASSUME_NO_REWARDS=1 run_escape fail unproven )
+check "an empty order address with the generation unverified is UNPROVEN, not 'nothing' (exit 3)" "$rc_unproven" 3
+grep -qi "the generation was never verified" "$FAKE/run.unproven.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL the unproven empty was not named as unproven"; }
+grep -qi "^nothing to recover" "$FAKE/run.unproven.log" \
+  && { fail=$((fail+1)); echo "FAIL reported a bare 'nothing to recover' on an unverified generation"; } \
+  || pass=$((pass+1))
+grep -qi "drift control could not run" "$FAKE/run.unproven.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL the flag did not say it also waived the drift control"; }
+
+# ...and the drift remedy must not send the client to a directory that does not exist: the
+# generations/ directories are named by the SOURCE hash, never by the applied hash the wrong
+# tree just derived.
+grep -qF "generations/<source hash>" "$FAKE/run.unregistered.log" \
+  && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL the remedy still names the applied hash as the directory"; }
+grep -qF "generations/<applied_hash>" "$FAKE/run.unregistered.log" \
+  && { fail=$((fail+1)); echo "FAIL the remedy names a directory that cannot exist"; } \
+  || pass=$((pass+1))
+
 echo "escape.test.sh: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
