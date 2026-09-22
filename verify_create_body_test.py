@@ -209,11 +209,13 @@ def _enc(v):
 
 
 def _datum(fx, beacon=None, a1=MIN_A1, a2=MIN_A2, asset1=(b"", b""), asset2=(TOK_POL, TOK_NAME),
-           pair_beacon=PB, asset1_beacon=A1B, asset2_beacon=A2B):
+           pair_beacon=PB, asset1_beacon=A1B, asset2_beacon=A2B, expiration=None):
     rat = lambda n, d: ("tag", 121, [n, d])
     none = ("tag", 122, [])
+    # tag 121 is constructor 0 = Some; tag 122 is constructor 1 = None
+    expiry = none if expiration is None else ("tag", 121, [expiration])
     fields = [beacon or fx.beacon, pair_beacon, asset1[0], asset1[1], asset1_beacon,
-              asset2[0], asset2[1], asset2_beacon, rat(*a1), rat(*a2), none, none]
+              asset2[0], asset2[1], asset2_beacon, rat(*a1), rat(*a2), none, expiry]
     return _enc(("tag", 121, fields))
 
 
@@ -277,6 +279,25 @@ def _run_cli(fx, body_path, extra=()):
          "--expect-pair", f".,{TOK_POL.hex()}.{TOK_NAME.hex()}",
          "--network", "testnet", "--aiken", _aiken(), "--project", fx.project, *extra],
         capture_output=True, text=True)
+
+
+def test_a_seed_that_names_an_expiration_is_refused(fx):
+    """A create is unconstrained on chain, so this gate is the last place it can be caught.
+
+    The bound validator's continuation gate requires `sd.expiration == None` on every reprice, and
+    the keeper's reprice carries the seed's datum forward — so a seed naming ANY expiration produces
+    a book whose first reprice the validator refuses, and every one after it. The dApp goes on
+    accepting fills against a quote nobody can move, until the expiry passes and it refuses those
+    too. The client witnesses this body themselves; after that it is on chain and permanent.
+    """
+    body = _body(fx, [_order_out(fx, datum_cbor=_datum(fx, expiration=1_800_000_000))])
+    refusals, _ = vcb.verify_body(body, fx.ceremony, fx.fund, 5_000_000, DEFAULT_PAIR)
+    _only(refusals, "expiration is set", "expiration = None")
+
+
+def test_a_seed_with_no_expiration_is_untouched_by_that_gate(fx):
+    refusals, _ = vcb.verify_body(vcb.load_body(fx.honest), fx.ceremony, fx.fund, 5_000_000, DEFAULT_PAIR)
+    assert refusals == []
 
 
 def test_real_honest_body_verifies(fx):
