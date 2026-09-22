@@ -21,7 +21,7 @@ set -euo pipefail
 
 # The base (unapplied) hash the validator source must compile to. A change here
 # re-parameterises every client ceremony, so it is pinned rather than trusted.
-EXPECTED_BOUND=18d2246d8b552b9e462ec93dece5716a7154314680b3f326a854789d
+EXPECTED_BOUND=19cc10abe5dfedee65c53d82548a1e6e2997f52c52a70af4170321fe
 
 AIKEN_VERSION=v1.1.22
 AIKEN_SHA256=d443f9deab109fd75ae19e22f7dfce4cdd2f70b3f68c152a6a23db6bc1ea76e1

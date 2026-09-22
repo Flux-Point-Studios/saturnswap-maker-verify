@@ -64,13 +64,13 @@ CROSSED_FLOORS = {
 # ceremony must be checked out at a pre-A commit and verified with that tool.
 # That is a real operational constraint, stated rather than papered over, and the
 # refusal a client would hit is asserted below.
-GOLDEN_UNAPPLIED_HASH = "18d2246d8b552b9e462ec93dece5716a7154314680b3f326a854789d"
-GOLDEN_APPLIED_HASH = "cb927890105ec125dfcdbad4f997a6ab04f4ff7f576dda96d30d2538"
+GOLDEN_UNAPPLIED_HASH = "19cc10abe5dfedee65c53d82548a1e6e2997f52c52a70af4170321fe"
+GOLDEN_APPLIED_HASH = "f9eba40078f64fe86f2b8ecb513b3b96fafddc21e8019a47885d5c09"
 GOLDEN_ORDER_ADDR = (
-    "addr_test1xqge9z36cwm9akl3q04xhvek9cums7drdupgjl0nr3qfz77tjfufq"
-    "yz7cyjalnd66nue0f4tqn607l6hdhdfd5cdy5uqw4cfjh"
+    "addr_test1xqge9z36cwm9akl3q04xhvek9cums7drdupgjl0nr3qfz7leawjqq"
+    "78kfl5x72uwedgnkwuklt7acg0gqxdy0zzatsyszwgs3l"
 )
-GOLDEN_REWARD_ADDR = "stake_test17r9ey7yszp0vzfwlekadf7vh564sfa8l0atkmk5k6vxj2wq6tu2xd"
+GOLDEN_REWARD_ADDR = "stake_test17ru7hfqq0rmyl6r09w8vk5fm8wt04lwuy85qrxj83pw4czgjd2v9s"
 
 # What the live preprod client is actually bound to, from the ceremony artefact
 # at rehearsal/ceremony.3227e143.json.
@@ -155,13 +155,13 @@ OPERATOR_VKEY_ENVELOPE = {
 # signatures answer, so a change to the challenge rule invalidates them loudly.
 GOLDEN_POSSESSION_PROOFS = {
     # the rehearsal ceremony on testnet
-    "9c9baaa6cf4628a7087773d63a1c3433af7ac8188379c809162e8fe004b1407c":
-        "f6a2671d05cea9e72404a0a3b1892f0f2ea64cf05fe8251ad3c188db7d6dffc5"
-        "b127010d4a9fb0db476459a0108aa53d08c33bfd584b2855ed165f624a24630d",
+    "993774bf630ed50443e1168ecd18558a1bfed0ac27cc1d786008ce5964ecaba4":
+        "3ae783a169cc4940c52b7b8d637033f7298ba4d2baed1d525cad72e8db2b423f"
+        "f27a2b9c39ff5735bc65a56ae4c76945c4aef4e6415051fc706faa49cdb06007",
     # the same nine parameters with both addresses re-encoded for mainnet
-    "5c9aed1d2d960d3e693449418df4e0284da4e4df3b835c98077aaf656d9e88ce":
-        "80850b369c435aee33bee60c890ddf1eebcc4b3d1c36940cf64f16f547ec8f67"
-        "8a90ca14f58f79ba0a52d98c26a19cb462358e756391c77636352c2f19e35304",
+    "cbd2744113e3449f5fd9f093a7fb17f3b832703063f82e79f9ffe90d49906bc7":
+        "8169f27b3e681b5fa77b4e4b9d82445f9076e57c62070193d298ba0631644e43"
+        "cf5a981903d6b7e72d9e6cf82f8711ca34958b7f9af2c4ba707b8aba2a798c0d",
 }
 
 
@@ -1929,7 +1929,7 @@ class PossessionChallenge(unittest.TestCase):
         nothing may be re-minted until that is understood."""
         self.assertEqual(
             challenge_for(GOLDEN_PARAMS).hex(),
-            "9c9baaa6cf4628a7087773d63a1c3433af7ac8188379c809162e8fe004b1407c")
+            "993774bf630ed50443e1168ecd18558a1bfed0ac27cc1d786008ce5964ecaba4")
 
     def test_the_challenge_transaction_is_what_build_raw_emits(self):
         """Pinned against a real `cardano-cli conway transaction build-raw --tx-in
