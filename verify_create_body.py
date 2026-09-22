@@ -360,6 +360,21 @@ def verify_body(body, ceremony, fund_bech32, max_fee, expect_pair):
         return refusals, assertions
 
     fields = detailed["fields"]
+
+    # ⚠️ AN EXPIRATION ON THE SEED BRICKS THE BOOK, AND THIS WAS THE ONLY PLACE A CLIENT COULD SEE IT.
+    # The bound validator's continuation gate requires `sd.expiration == None` on every reprice, and
+    # the keeper's reprice carries the seed's datum forward — so a create that names ANY expiration
+    # produces a book whose first reprice the validator refuses, for ever, while the dApp goes on
+    # accepting fills against a quote nobody can move until the expiry passes and it refuses those
+    # too. The create itself is unconstrained on chain, so nothing downstream catches it: this gate,
+    # run by the client before they witness, is the last point at which it is still free to fix.
+    expiration = fields[11]
+    if isinstance(expiration, dict) and expiration.get("constructor") == 0:
+        refusals.append(
+            "order datum: expiration is set. A bound book's continuation gate requires no expiration, "
+            "so the keeper's first reprice would be refused by the validator and every later one after "
+            "it — the book would rest at this quote permanently. Create the seed with expiration = None")
+
     a1 = vc._pd_rational(fields[8])
     a2 = vc._pd_rational(fields[9])
     assertions["asset1Price"] = f"{a1[0]}/{a1[1]}"
