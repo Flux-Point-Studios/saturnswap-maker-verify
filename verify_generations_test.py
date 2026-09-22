@@ -8,12 +8,35 @@ they funded and `escape.sh` correctly refuses to act on it — which leaves the 
 the operator, the one thing it is supposed to never need. So each generation gets a row here and a
 directory, and `test_every_published_generation_is_documented` fails if the two ever disagree.
 """
+import json
 import os
 import re
 import unittest
 from verify_ceremony_test import GOLDEN_PARAMS, GOLDEN_APPLIED_HASH, HERE, run_tool
 
-CURRENT_HASH = "19cc10abe5dfedee65c53d82548a1e6e2997f52c52a70af4170321fe"
+
+def _committed_root_hash() -> str:
+    """The generation the ROOT actually ships, read from its committed blueprint.
+
+    Not a literal. Every other copy of "which generation is current" in this repository has gone
+    stale at least once — the README said `18d2246d…` for as long as that was true and then kept
+    saying it — so the one the documentation guard compares against is taken from the artifact
+    instead. `verify_project.sh` keeps its own independent literal on purpose: that one exists to
+    catch the blueprint itself drifting from the source, and reading it from the blueprint would
+    make it compare the build to itself.
+    """
+    with open(os.path.join(HERE, "plutus.json")) as fh:
+        blueprint = json.load(fh)
+    hashes = {
+        v["hash"] for v in blueprint["validators"]
+        if v.get("title", "").startswith("maker_stake_bound.")
+    }
+    if len(hashes) != 1:
+        raise AssertionError(f"the root blueprint does not name exactly one bound generation: {hashes}")
+    return hashes.pop()
+
+
+CURRENT_HASH = _committed_root_hash()
 
 # Each retired generation, with the ceremony the SAME nine parameters produce on it. The proofs are
 # committed because the challenge binds the generation: a signature minted for one cannot answer
