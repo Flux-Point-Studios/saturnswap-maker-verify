@@ -52,7 +52,7 @@ JSON
 #     verify_ceremony_test.py     GOLDEN_APPLIED_HASH, GOLDEN_UNAPPLIED_HASH, GOLDEN_REWARD_ADDR
 #     verify_ceremony_test.py     GOLDEN_POSSESSION_PROOFS  (signatures — must be RE-MINTED, not edited)
 #     verify_ceremony_test.py     the challenge pin in test_the_challenge_wire_format_is_pinned
-APPLIED=cb927890105ec125dfcdbad4f997a6ab04f4ff7f576dda96d30d2538
+APPLIED=f9eba40078f64fe86f2b8ecb513b3b96fafddc21e8019a47885d5c09
 DAPP=11928a3ac3b65edbf103ea6bb3362e39b879a36f02897df31c40917b
 BEACON=8a199a17ef4517215945aaf3c8c5204c60fd94d34c46d341e99c8fcf
 

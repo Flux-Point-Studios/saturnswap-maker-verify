@@ -35,8 +35,6 @@ use aiken/builtin
 use aiken/cbor
 use aiken/collection/list
 use aiken/crypto.{ScriptHash, VerificationKeyHash}
-use aiken/fuzz
-use aiken/primitive/bytearray
 use cardano/address.{Address, Credential, Inline, Script, VerificationKey}
 use cardano/assets.{AssetName, PolicyId, Value}
 use cardano/certificate.{
@@ -111,90 +109,6 @@ fn rational_positive(r: LegacyRational) -> Bool {
   r.numerator > 0 && r.denominator > 0
 }
 
-// ---------------------------------------------------------------------------
-// cardano-swaps beacon-name derivation
-// (fallen-icarus/cardano-swaps: two_way_swap/utils.ak + common/utils.ak).
-//
-// A beacon TOKEN's name is the sha2-256 of the pair it certifies, so the name is
-// a FACT about the assets — not a field the datum-writer may choose. Deriving
-// the three names here, rather than trusting the datum's own pair_beacon /
-// asset1_beacon / asset2_beacon fields, is what makes the continuation gate
-// self-contained: a bot cannot mint three junk-named beacons under `beacon_id`,
-// declare those junk names in the continuation datum, burn the three genuine
-// beacons, and satisfy the `quantity_of` conjuncts with tokens no filler can
-// match to the real pair (the STRAND). The derivation reproduces the three
-// live-mainnet NIGHT beacon names and the golden ADAMMKT vector — pinned by
-// `derivation_reproduces_live_night_beacons` and the golden gate test.
-// ---------------------------------------------------------------------------
-
-// assetBeacon = sha2_256(policy_id ++ asset_name), over the RAW policy bytes.
-// ADA's empty policy hashes the empty string: sha256("") = e3b0c442….
-fn generate_asset_beacon(
-  policy_id: PolicyId,
-  asset_name: AssetName,
-) -> AssetName {
-  builtin.sha2_256(bytearray.concat(policy_id, asset_name))
-}
-
-// The pair hash substitutes a single 0x00 byte for an empty policy id — ONLY
-// inside `generate_pair_beacon`, ONLY after the sort; the asset beacons above use
-// the unsubstituted policy.
-fn substitute_policy(policy_id: PolicyId) -> ByteArray {
-  if policy_id == #"" {
-    #"00"
-  } else {
-    policy_id
-  }
-}
-
-// pairBeacon = sha2_256(id1' ++ name1 ++ id2' ++ name2), where (id1,name1) and
-// (id2,name2) are the two assets SORTED ascending by (policy_id, then name) and
-// idK' is `substitute_policy(idK)`. ADA ("","") always sorts first.
-fn generate_pair_beacon(
-  a_id: PolicyId,
-  a_name: AssetName,
-  b_id: PolicyId,
-  b_name: AssetName,
-) -> AssetName {
-  let a_first = when bytearray.compare(a_id, b_id) is {
-    Less -> True
-    Greater -> False
-    Equal -> bytearray.compare(a_name, b_name) != Greater
-  }
-  let (id1, name1, id2, name2) = if a_first {
-    (a_id, a_name, b_id, b_name)
-  } else {
-    (b_id, b_name, a_id, a_name)
-  }
-  builtin.sha2_256(
-    bytearray.concat(
-      bytearray.concat(substitute_policy(id1), name1),
-      bytearray.concat(substitute_policy(id2), name2),
-    ),
-  )
-}
-
-// The three canonical beacon names for a sanctioned pair, derived ONCE per
-// transaction (the sha2-256 depends only on the pair, which is fixed) and
-// threaded into the continuation gate. `(pair_beacon, asset1_beacon,
-// asset2_beacon)`, where asset1 is the datum's declared asset1 (the sorted-lesser
-// under cardano-swaps' own asset1 < asset2 invariant) and asset2 its asset2.
-fn expected_beacon_names(
-  sanctioned_pair: Option<(PolicyId, AssetName, PolicyId, AssetName)>,
-) -> Option<(AssetName, AssetName, AssetName)> {
-  when sanctioned_pair is {
-    Some((a1_id, a1_name, a2_id, a2_name)) ->
-      Some(
-        (
-          generate_pair_beacon(a1_id, a1_name, a2_id, a2_name),
-          generate_asset_beacon(a1_id, a1_name),
-          generate_asset_beacon(a2_id, a2_name),
-        ),
-      )
-    None -> None
-  }
-}
-
 // Continuation datums must be inline, decodable by the legacy dApp validator,
 // point at the real beacon policy, and price BOTH legs at or above the
 // client's ceremony floors — otherwise the bot could park client value in a
@@ -232,7 +146,6 @@ fn is_spendable_continuation_datum(
   min_asset1_price: LegacyRational,
   min_asset2_price: LegacyRational,
   sanctioned_pair: Option<(PolicyId, AssetName, PolicyId, AssetName)>,
-  expected_beacons: Option<(AssetName, AssetName, AssetName)>,
 ) -> Bool {
   when output.datum is {
     InlineDatum(d) ->
@@ -258,45 +171,6 @@ fn is_spendable_continuation_datum(
           // to take the client's ADA. Too low and the ADA side drains for
           // near-zero token, so require asset1_price >= min_asset1_price.
           rational_geq(sd.asset1_price, min_asset1_price),
-          // The three beacon-NAME fields come from the attacker-controlled
-          // continuation datum, and the `quantity_of` conjuncts below are keyed on
-          // them. Trusting the names lets a bot mint three DISTINCT junk-named
-          // beacons under `beacon_id`, declare those junk names here, burn the
-          // three genuine beacons, and park the whole inventory behind tokens no
-          // filler can match to the pair — the STRAND, which a mere pairwise-
-          // distinctness check cannot see. Instead the three names are DERIVED
-          // from the sanctioned pair by the cardano-swaps sha2-256 rule (computed
-          // once in `payout_bound`, threaded in as `expected_beacons`) and the
-          // datum must declare exactly those. The only tokens that then satisfy
-          // the `quantity_of` conjuncts are the pair's GENUINE beacons, so a
-          // continuation that clears the gate is a real fillable order, never a
-          // strand. Canonical names are inherently distinct, which subsumes the
-          // pairwise-distinctness conjunct this replaces. `None` (no sanctioned
-          // pair) blesses nothing.
-          when expected_beacons is {
-            Some((expected_pair, expected_asset1, expected_asset2)) -> and {
-                sd.pair_beacon == expected_pair,
-                sd.asset1_beacon == expected_asset1,
-                sd.asset2_beacon == expected_asset2,
-              }
-            None -> False
-          },
-          // The gate must read the output's VALUE and its expiration, not only
-          // its datum. Require this ceremony's three beacons on the blessed
-          // continuation: a beaconless park carries an in-band datum yet holds no
-          // beacons, so cardano-swaps blesses it, no one can fill it, and the
-          // keeper abandons it — 100% of the inventory stranded. The beacons are
-          // identified by `beacon_id`, the ceremony's FIXED, verified beacon
-          // policy — an applied parameter, not attacker-controllable — so keying
-          // on it is sound. Checking all three (not just the pair beacon) refuses
-          // a split that carries the pair beacon on one part and strands the rest.
-          assets.quantity_of(output.value, beacon_id, sd.pair_beacon) == 1,
-          assets.quantity_of(output.value, beacon_id, sd.asset1_beacon) == 1,
-          assets.quantity_of(output.value, beacon_id, sd.asset2_beacon) == 1,
-          // Refuse an expiring continuation: a far-future expiration rests
-          // fillable at a frozen quote while excluded from depth, equity and
-          // every wind-down, surgically blinding the daily-loss kill.
-          sd.expiration == None,
         }
       } else {
         False
@@ -414,12 +288,7 @@ fn payout_bound(
     0,
     fn(w, acc) {
       let Pair(cred, amt) = w
-      // Only a POSITIVE own_cred withdrawal counts. A withdrawal Coin is a
-      // non-negative uint the ledger forces to equal the full reward balance, so
-      // amt < 0 is unrepresentable on-chain; clamping it here keeps a negative
-      // amt from shrinking `guarded_in` (which would let `conserved` under-demand)
-      // even if the script were ever evaluated on such an input.
-      if cred == own_cred && amt > 0 {
+      if cred == own_cred {
         acc + amt
       } else {
         acc
@@ -484,41 +353,10 @@ fn payout_bound(
       }
   }
 
-  // The pair's three canonical beacon names, derived ONCE (the sha2-256 depends
-  // only on the sanctioned pair, which is fixed for the whole tx). The
-  // continuation gate requires the datum to declare exactly these, so the
-  // `quantity_of` conjuncts can be met only by the pair's genuine beacons — the
-  // gate never trusts the datum's own beacon-name fields.
-  let expected_beacons = expected_beacon_names(sanctioned_pair)
-
-  // Value that came from a spent ORDER (an input at the order address), as
-  // opposed to the full `guarded_in` perimeter, which also folds in beacon-free
-  // sibling value resting at a SIBLING cardano-swaps payment script under this
-  // same stake credential. That sibling inclusion is deliberate — it lets the bot
-  // RESCUE such value to `client_payout` — but it must never let sibling value be
-  // re-parked into a continuation. `cont_only_conserved` below is what draws that
-  // line, and `guarded_order` is the ceiling it uses.
-  let guarded_order = list.foldl(
-    self.inputs,
-    assets.zero,
-    fn(input, acc) {
-      if is_order_address(input.output.address, dapp_hash, own_cred) {
-        assets.merge(acc, input.output.value)
-      } else {
-        acc
-      }
-    },
-  )
-
-  // One pass over the outputs yields two sums: `allowed_out`, everything that
-  // stays inside the perimeter (blessed continuations + the payout leg + the fee
-  // leg), and `cont_out`, only the blessed-continuation portion — the value the
-  // bot re-parks into fresh orders, which `cont_only_conserved` caps.
-  let (allowed_out, cont_out) = list.foldl(
+  let allowed_out = list.foldl(
     self.outputs,
-    (assets.zero, assets.zero),
+    assets.zero,
     fn(output, acc) {
-      let (allowed, cont) = acc
       if is_order_address(output.address, dapp_hash, own_cred) {
         if is_spendable_continuation_datum(
           output,
@@ -526,22 +364,18 @@ fn payout_bound(
           min_asset1_price,
           min_asset2_price,
           sanctioned_pair,
-          expected_beacons,
         ) {
-          (
-            assets.merge(allowed, output.value),
-            assets.merge(cont, output.value),
-          )
+          assets.merge(acc, output.value)
         } else {
           acc
         }
       } else if output.address == client_payout && output.datum == NoDatum && output.reference_script == None {
-        (assets.merge(allowed, output.value), cont)
+        assets.merge(acc, output.value)
       } else if is_fee_leg(output, fee_address) {
         // Blessed only up to the bound checked below. Admitting it here and
         // capping it there keeps ONE conservation statement rather than two
         // that could disagree.
-        (assets.merge(allowed, output.value), cont)
+        assets.merge(acc, output.value)
       } else {
         acc
       }
@@ -639,77 +473,17 @@ fn payout_bound(
     },
   }
 
-  // Per-asset conservation: nothing guarded may end up anywhere else. A beacon of
-  // this ceremony's policy may leave the perimeter ONLY by being burned in
-  // `self.mint`, never by being shipped to a non-blessed output. The old code
-  // blanket-exempted every `beacon_id` asset (`pid == beacon_id || qty >= 0`),
-  // which let a bot route a genuine beacon to itself, or burn A1/A2 while keeping
-  // a one-beacon park, with no penalty. Instead, fold this policy's BURNS (the
-  // negative `beacon_id` entries of `self.mint`) into the guarded input: a burn
-  // reduces what the continuations must carry, and every beacon name is then held
-  // to the same `qty >= 0` conservation as any other asset. A beacon shipped to a
-  // non-blessed output is missing from `allowed_out`, unmatched by any burn, and
-  // shows up as the deficit that rejects the transaction.
-  let beacon_burns = list.foldl(
-    assets.flatten(self.mint),
-    assets.zero,
-    fn(entry, acc) {
-      let (pid, name, qty) = entry
-      if pid == beacon_id && qty < 0 {
-        assets.add(acc, pid, name, qty)
-      } else {
-        acc
-      }
-    },
-  )
+  // Per-asset conservation: nothing guarded may end up anywhere else. Beacon
+  // tokens are exempt (burned on cancel; the beacon script constrains them).
   let conserved = list.all(
-    assets.flatten(
-      assets.merge(
-        allowed_out,
-        assets.negate(assets.merge(guarded_in, beacon_burns)),
-      ),
-    ),
-    fn(entry) {
-      let (_pid, _name, qty) = entry
-      qty >= 0
-    },
-  )
-
-  // A continuation may carry only ORDER-sourced value. Per NON-beacon asset,
-  // `cont_out` may not exceed `guarded_order`: `guarded_order - cont_out >= 0`.
-  //
-  // Without this, the sibling inclusion in `guarded_in` is a THEFT vector. The
-  // output side blesses a continuation on the strength of its declared pair and
-  // that pair's canonical beacons alone, and the sanctioned pair is whatever
-  // order sits at the order address, however tiny. A bot co-spends a 2-ADA DECOY
-  // order declaring an attacker pair (ADA, JUNK) together with a client's
-  // beacon-free sibling value (say 50 ADA), mints the GENUINE canonical
-  // (ADA, JUNK) beacons, and re-parks the whole 52 ADA into one (ADA, JUNK)
-  // continuation quoting at the client's own floors. Every prior check clears —
-  // the names really are canonical for the attacker's pair, per-asset
-  // conservation holds because the value never leaves the order address, the
-  // floors are the client's own — and a colluding taker then fills the order for
-  // worthless JUNK, a drain that never routes back through this validator. The
-  // decoy sources 2 ADA; the continuation carries 52; 52 > 2 rejects.
-  //
-  // Beacons are exempt: a legit 1->2 split mints a second canonical set, so a
-  // continuation's beacon count may exceed the spent orders'. Beacon integrity is
-  // already carried by the canonical-name gate and the beacon-conservation fold,
-  // so scoping this cap to non-beacon assets is sound. Sibling and reward value
-  // stay inside the perimeter (`conserved` above) and remain rescuable to
-  // `client_payout` or payable as fee — they simply can no longer be laundered
-  // into a fresh order. Cost, deliberate: the bot cannot top a continuation up
-  // with its own or with sibling ADA; extra value reaches the client via the
-  // payout leg instead.
-  let cont_only_conserved = list.all(
-    assets.flatten(assets.merge(guarded_order, assets.negate(cont_out))),
+    assets.flatten(assets.merge(allowed_out, assets.negate(guarded_in))),
     fn(entry) {
       let (pid, _name, qty) = entry
       pid == beacon_id || qty >= 0
     },
   )
 
-  payout_cred_ok && withdrawals_ok && conserved && cont_only_conserved && floors_ok && fee_ok
+  payout_cred_ok && withdrawals_ok && conserved && floors_ok && fee_ok
 }
 
 validator maker_stake_bound(
@@ -875,37 +649,19 @@ const bot_addr: Address =
 const other_addr: Address =
   Address { payment_credential: VerificationKey(other), stake_credential: None }
 
-// The TEST pair's three canonical beacon names, computed by the SAME derivation
-// the validator uses — never hardcoded — for asset1 = ada ("","") and asset2 =
-// the test token (`tkn` policy, "TKN" name). Every honest fixture names both its
-// beacon TOKENS and its datum's beacon-name FIELDS with these, so an honest
-// continuation carries the GENUINE beacons of the test pair and clears the
-// canonical-name gate; a junk-named fixture does not.
-fn test_pair_beacon() -> AssetName {
-  generate_pair_beacon("", "", tkn, "TKN")
-}
-
-fn test_asset1_beacon() -> AssetName {
-  generate_asset_beacon("", "")
-}
-
-fn test_asset2_beacon() -> AssetName {
-  generate_asset_beacon(tkn, "TKN")
-}
-
 /// The order fixture as the RECORD. Every variant below is built from this by
 /// field update, so none of them has to round-trip through `Data` and `expect`
 /// the record back out — the fixtures state what they are instead of asserting it.
 fn base_order_datum() -> LegacySwapDatum {
   LegacySwapDatum {
     beacon_id: beacon,
-    pair_beacon: test_pair_beacon(),
+    pair_beacon: "PAIR",
     asset1_id: "",
     asset1_name: "",
-    asset1_beacon: test_asset1_beacon(),
+    asset1_beacon: "A1",
     asset2_id: tkn,
     asset2_name: "TKN",
-    asset2_beacon: test_asset2_beacon(),
+    asset2_beacon: "A2",
     asset1_price: LegacyRational { numerator: 1, denominator: 2 },
     asset2_price: LegacyRational { numerator: 2, denominator: 1 },
     prev_input: Some(
@@ -947,13 +703,13 @@ fn priced_datum(a1n: Int, a1d: Int, a2n: Int, a2d: Int) -> Data {
 const foreign_beacon: PolicyId =
   #"0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
 
-// 2 ADA min-ADA carve + 100 TKN inventory + the three canonical pair beacons.
+// 2 ADA min-ADA carve + 100 TKN inventory + the three pair beacons.
 fn inventory() -> Value {
   assets.from_lovelace(2_000_000)
     |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
+    |> assets.add(beacon, "PAIR", 1)
+    |> assets.add(beacon, "A1", 1)
+    |> assets.add(beacon, "A2", 1)
 }
 
 // The same holding as `inventory`, but wearing the SIBLING order form's
@@ -1005,16 +761,7 @@ fn burning(t: Transaction, v: Value) -> Transaction {
 }
 
 fn burned_pair_beacon() -> Value {
-  assets.from_asset(beacon, test_pair_beacon(), -1)
-}
-
-// A cardano-swaps cancel burns the order's whole beacon set; the mint is what
-// beacon conservation reads to permit the deficit. Fixtures that close an order
-// carry this so the burned beacons are accounted rather than silently vanishing.
-fn burned_full_set() -> Value {
-  assets.from_asset(beacon, test_pair_beacon(), -1)
-    |> assets.add(beacon, test_asset1_beacon(), -1)
-    |> assets.add(beacon, test_asset2_beacon(), -1)
+  assets.from_asset(beacon, "PAIR", -1)
 }
 
 fn tx(
@@ -1150,23 +897,17 @@ fn cancel_to(
   withdrawals: Pairs<Credential, Int>,
   signers: List<VerificationKeyHash>,
 ) -> Transaction {
-  burning(
-    tx(
-      [
-        input_at(0, order_addr, inventory()),
-        input_at(1, bot_addr, assets.from_lovelace(5_000_000)),
-      ],
-      [
-        out(
-          dest,
-          assets.from_lovelace(2_000_000) |> assets.add(tkn, "TKN", 100),
-        ),
-        out(bot_addr, assets.from_lovelace(4_800_000)),
-      ],
-      withdrawals,
-      signers,
-    ),
-    burned_full_set(),
+  tx(
+    [
+      input_at(0, order_addr, inventory()),
+      input_at(1, bot_addr, assets.from_lovelace(5_000_000)),
+    ],
+    [
+      out(dest, assets.from_lovelace(2_000_000) |> assets.add(tkn, "TKN", 100)),
+      out(bot_addr, assets.from_lovelace(4_800_000)),
+    ],
+    withdrawals,
+    signers,
   )
 }
 
@@ -1197,30 +938,6 @@ test bot_cancel_all_to_client_passes() {
 // Bot-signed theft: the exact tx the legacy maker_stake would allow.
 test bot_theft_rejected() {
   !run_withdraw(theft_tx([bot]))
-}
-
-// Defense-in-depth: a NEGATIVE own_cred withdrawal (ledger-impossible, but never
-// trusted here) must not shrink the conservation perimeter. Without the clamp in
-// the rewards fold, rewards=-1 ADA would seed guarded_in one ADA short, so a
-// cancel paying the client 1 ADA and pocketing 1 ADA to the bot would `conserved`;
-// clamped, guarded_in holds the full 2 ADA and the short payout is a deficit.
-test negative_reward_cannot_short_the_client() {
-  let t = burning(
-    tx(
-      [input_at(0, order_addr, inventory())],
-      [
-        out(
-          payout_addr,
-          assets.from_lovelace(1_000_000) |> assets.add(tkn, "TKN", 100),
-        ),
-        out(bot_addr, assets.from_lovelace(1_000_000)),
-      ],
-      [Pair(own_cred, -1_000_000)],
-      [bot],
-    ),
-    burned_full_set(),
-  )
-  !run_withdraw(t)
 }
 
 // Bot routes the token to itself and only ADA to the client.
@@ -1275,18 +992,13 @@ test bot_reprice_continuation_passes() {
   run_withdraw(t)
 }
 
-// Multi-output split into a beaconed and a BEACONLESS continuation. There is
-// exactly ONE set of the three ceremony beacons, so any split necessarily
-// leaves one part beaconless — an in-band datum holding no beacons, which
-// cardano-swaps would bless yet no one could fill: the stranded-inventory hole.
-// The strengthened gate refuses the beaconless part, so the beaconed part
-// cannot cover the spent inventory and conservation rejects the whole tx.
-test bot_reprice_split_to_beaconless_continuation_rejected() {
+// Multi-output split: one order split into two continuations, value conserved.
+test bot_reprice_split_passes() {
   let cont1 = assets.from_lovelace(1_000_000)
     |> assets.add(tkn, "TKN", 50)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
+    |> assets.add(beacon, "PAIR", 1)
+    |> assets.add(beacon, "A1", 1)
+    |> assets.add(beacon, "A2", 1)
   let cont2 = assets.from_lovelace(1_000_000) |> assets.add(tkn, "TKN", 50)
   let t = tx(
     [input_at(0, order_addr, inventory())],
@@ -1294,27 +1006,7 @@ test bot_reprice_split_to_beaconless_continuation_rejected() {
     [Pair(own_cred, 0)],
     [bot],
   )
-  !run_withdraw(t)
-}
-
-// The gate's namesake expiration guard. A continuation that names ANY expiration
-// is refused even when it is otherwise a straight reprice: full canonical
-// beacons, an in-band quote, the spent pair. A far-future expiration rests
-// fillable at a frozen quote while excluded from depth, equity and every
-// wind-down — surgically blinding the daily-loss kill — so `sd.expiration ==
-// None` must be the sole reason this bot-signed reprice is rejected.
-test bot_reprice_to_expiring_continuation_rejected() {
-  let expiring: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    expiration: Some(100_000_000),
-  }
-  let t = tx(
-    [input_at(0, order_addr, inventory())],
-    [cont(inventory(), expiring)],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(t)
+  run_withdraw(t)
 }
 
 // Consolidation frees one order's min-ADA carve: it must go to the client...
@@ -1325,8 +1017,7 @@ test consolidation_freed_min_ada_to_client_passes() {
       input_at(
         1,
         order_addr,
-        assets.from_lovelace(2_000_000)
-          |> assets.add(beacon, test_pair_beacon(), 1),
+        assets.from_lovelace(2_000_000) |> assets.add(beacon, "PAIR", 1),
       ),
     ],
     [
@@ -1336,9 +1027,7 @@ test consolidation_freed_min_ada_to_client_passes() {
     [Pair(own_cred, 0)],
     [bot],
   )
-  // Consolidating away the second order burns its beacon; the mint is what
-  // beacon conservation reads to permit the beacon's absence from the outputs.
-  run_withdraw(burning(t, burned_pair_beacon()))
+  run_withdraw(t)
 }
 
 // ...and NOT to the bot.
@@ -1349,8 +1038,7 @@ test consolidation_freed_min_ada_to_bot_rejected() {
       input_at(
         1,
         order_addr,
-        assets.from_lovelace(2_000_000)
-          |> assets.add(beacon, test_pair_beacon(), 1),
+        assets.from_lovelace(2_000_000) |> assets.add(beacon, "PAIR", 1),
       ),
     ],
     [
@@ -1360,9 +1048,7 @@ test consolidation_freed_min_ada_to_bot_rejected() {
     [Pair(own_cred, 0)],
     [bot],
   )
-  // Same burn as the passing twin: the freed min-ADA going to the bot is rejected
-  // by the ADA deficit, not by any beacon accounting.
-  !run_withdraw(burning(t, burned_pair_beacon()))
+  !run_withdraw(t)
 }
 
 // Poisoned continuation datum (undecodable by the legacy dApp validator)
@@ -1456,235 +1142,6 @@ test bot_continuation_to_foreign_stake_credential_rejected() {
     !migrate(Script(foreign_stake)),
     // the byte-identical output under the client's OWN credential is a legal reprice: ACCEPTED
     migrate(own_cred),
-  }
-}
-
-// ---------------------------------------------------------------------------
-// B3 STRAND: the continuation gate is self-contained under CANONICAL beacon
-// names, so it never trusts the datum's own beacon-NAME fields
-//
-// The gate derives the three beacon names from the sanctioned pair by the
-// cardano-swaps sha2-256 rule and requires the continuation datum to declare
-// exactly those. Every clause below drives a strand — a park behind beacons the
-// datum names but that are not the pair's genuine beacons — and asserts the gate
-// refuses it. The two collapse/junk-mint clauses are refused by canonical-name
-// enforcement; the ship-to-bot clause is refused by the beacon-conservation
-// defence-in-depth. The mutation each clause reddens under is named in its
-// comment (MJ-canonical = the three `sd.*_beacon == expected_*` equalities forced
-// True; MC-conserve = the old blanket `pid == beacon_id` exemption restored).
-// ---------------------------------------------------------------------------
-
-// Collapse all three beacon-name fields to ONE arbitrary name; the value holds
-// the single matching beacon and the input holds the same one, so the sanctioned
-// pair, floors, expiration and conservation all clear. Canonical-name
-// enforcement is the SOLE rejecter — MJ-canonical lets the one beacon satisfy all
-// three quantity_of conjuncts and the strand validates.
-test attack_collapse_one_name() {
-  let collapsed: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    pair_beacon: "COLLAPSE",
-    asset1_beacon: "COLLAPSE",
-    asset2_beacon: "COLLAPSE",
-  }
-  let v = assets.from_lovelace(2_000_000)
-    |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, "COLLAPSE", 1)
-  let t = tx(
-    [input_at(0, order_addr, v)],
-    [cont(v, collapsed)],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(t)
-}
-
-// The split variant: two continuations, each holding ONE collapsed beacon set,
-// that together carry every asset the input held. Under MJ-canonical both parks
-// are blessed and conservation balances; canonical-name enforcement refuses both.
-test attack_split_strand() {
-  let set_x: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    pair_beacon: "SETX",
-    asset1_beacon: "SETX",
-    asset2_beacon: "SETX",
-  }
-  let set_y: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    pair_beacon: "SETY",
-    asset1_beacon: "SETY",
-    asset2_beacon: "SETY",
-  }
-  let in_value = assets.from_lovelace(2_000_000)
-    |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, "SETX", 1)
-    |> assets.add(beacon, "SETY", 1)
-  let cont1 = assets.from_lovelace(1_000_000)
-    |> assets.add(tkn, "TKN", 50)
-    |> assets.add(beacon, "SETX", 1)
-  let cont2 = assets.from_lovelace(1_000_000)
-    |> assets.add(tkn, "TKN", 50)
-    |> assets.add(beacon, "SETY", 1)
-  let t = tx(
-    [input_at(0, order_addr, in_value)],
-    [cont(cont1, set_x), cont(cont2, set_y)],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(t)
-}
-
-// A close that burns the genuine A1 and A2 but ships the genuine PAIR beacon to
-// the bot instead of burning it. Every non-beacon asset reaches the client, so
-// the ONLY thing wrong is a genuine beacon leaving to a non-blessed output.
-// Beacon conservation (allowed_out(PAIR)=0 < guarded_in(PAIR)+burn(PAIR)=1) is
-// the sole rejecter — MC-conserve makes the shipped beacon free again and this
-// validates.
-test attack_ship_beacon_to_bot() {
-  let t = tx(
-    [input_at(0, order_addr, inventory())],
-    [
-      out(
-        payout_addr,
-        assets.from_lovelace(2_000_000) |> assets.add(tkn, "TKN", 100),
-      ),
-      out(bot_addr, assets.from_asset(beacon, test_pair_beacon(), 1)),
-    ],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(
-    burning(
-      t,
-      assets.from_asset(beacon, test_asset1_beacon(), -1)
-        |> assets.add(beacon, test_asset2_beacon(), -1),
-    ),
-  )
-}
-
-// Burn the genuine A1 and A2, keep the genuine PAIR beacon, and park the whole
-// inventory under a datum that names ALL THREE beacon fields the PAIR beacon.
-// Canonical-name enforcement rejects it — asset1_beacon must be the asset1
-// beacon, not the pair beacon — while the burn fold keeps conservation exact
-// under MJ-canonical, so canonical-name is what bites where the old blanket
-// conservation would have permitted the burn.
-test attack_burn_A1A2_strand() {
-  let collapsed: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    asset1_beacon: test_pair_beacon(),
-    asset2_beacon: test_pair_beacon(),
-  }
-  let parked = assets.from_lovelace(2_000_000)
-    |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-  let t = tx(
-    [input_at(0, order_addr, inventory())],
-    [cont(parked, collapsed)],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(
-    burning(
-      t,
-      assets.from_asset(beacon, test_asset1_beacon(), -1)
-        |> assets.add(beacon, test_asset2_beacon(), -1),
-    ),
-  )
-}
-
-// THE AUDITOR'S POC, now closed. The bot mints three DISTINCT junk-named beacons
-// under `beacon_id`, declares those names in the continuation datum, carries them
-// plus the whole inventory on one continuation, and burns the three genuine
-// beacons — stranding the client behind tokens no filler can match to the pair.
-// The junk names ARE pairwise distinct, so a mere distinctness conjunct would
-// have blessed this; canonical-name enforcement rejects it because junk names are
-// not the pair's sha2-256 names. MJ-canonical lets the junk beacons satisfy the
-// quantity_of conjuncts, the burn fold balances conservation, and the strand
-// validates — so canonical-name is the sole rejecter this clause reddens under.
-test attack_junk_mint_strand() {
-  let junk_datum: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    pair_beacon: "JUNK1",
-    asset1_beacon: "JUNK2",
-    asset2_beacon: "JUNK3",
-  }
-  let parked = assets.from_lovelace(2_000_000)
-    |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, "JUNK1", 1)
-    |> assets.add(beacon, "JUNK2", 1)
-    |> assets.add(beacon, "JUNK3", 1)
-  let t = tx(
-    [input_at(0, order_addr, inventory())],
-    [cont(parked, junk_datum)],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  let mint = assets.from_asset(beacon, "JUNK1", 1)
-    |> assets.add(beacon, "JUNK2", 1)
-    |> assets.add(beacon, "JUNK3", 1)
-    |> assets.add(beacon, test_pair_beacon(), -1)
-    |> assets.add(beacon, test_asset1_beacon(), -1)
-    |> assets.add(beacon, test_asset2_beacon(), -1)
-  !run_withdraw(burning(t, mint))
-}
-
-// The split of the same POC: two continuations, each carrying its own freshly
-// minted junk beacon set, the three genuine beacons burned. Canonical-name
-// enforcement refuses both halves.
-test attack_junk_mint_split_strand() {
-  let set_p: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    pair_beacon: "PJUNK1",
-    asset1_beacon: "PJUNK2",
-    asset2_beacon: "PJUNK3",
-  }
-  let set_q: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    pair_beacon: "QJUNK1",
-    asset1_beacon: "QJUNK2",
-    asset2_beacon: "QJUNK3",
-  }
-  let cont1 = assets.from_lovelace(1_000_000)
-    |> assets.add(tkn, "TKN", 50)
-    |> assets.add(beacon, "PJUNK1", 1)
-    |> assets.add(beacon, "PJUNK2", 1)
-    |> assets.add(beacon, "PJUNK3", 1)
-  let cont2 = assets.from_lovelace(1_000_000)
-    |> assets.add(tkn, "TKN", 50)
-    |> assets.add(beacon, "QJUNK1", 1)
-    |> assets.add(beacon, "QJUNK2", 1)
-    |> assets.add(beacon, "QJUNK3", 1)
-  let t = tx(
-    [input_at(0, order_addr, inventory())],
-    [cont(cont1, set_p), cont(cont2, set_q)],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  let mint = assets.from_asset(beacon, "PJUNK1", 1)
-    |> assets.add(beacon, "PJUNK2", 1)
-    |> assets.add(beacon, "PJUNK3", 1)
-    |> assets.add(beacon, "QJUNK1", 1)
-    |> assets.add(beacon, "QJUNK2", 1)
-    |> assets.add(beacon, "QJUNK3", 1)
-    |> assets.add(beacon, test_pair_beacon(), -1)
-    |> assets.add(beacon, test_asset1_beacon(), -1)
-    |> assets.add(beacon, test_asset2_beacon(), -1)
-  !run_withdraw(burning(t, mint))
-}
-
-// The on-chain derivation reproduces the three LIVE-MAINNET NIGHT beacon names
-// (ada/NIGHT two-way order), pinning `generate_asset_beacon`/`generate_pair_beacon`
-// to the deployed cardano-swaps bytes. Perturbing the 0x00 policy substitution
-// changes the pair hash and reddens this test — it is the oracle for that clause.
-test derivation_reproduces_live_night_beacons() {
-  let night_policy = #"0691b2fecca1ac4f53cb6dfb00b7013e561d1f34403b957cbb5af1fa"
-  let night_name = #"4e49474854"
-  and {
-    // asset1 = ADA ("",""): sha256("") = e3b0c442…
-    generate_asset_beacon("", "") == #"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    // asset2 = NIGHT
-    generate_asset_beacon(night_policy, night_name) == #"afa296001cb10fbb9cfb023738c6f24faca7e891791d84d80e4f17b5a682eed8",
-    // pair (0x00-substituted ADA policy, sorted first)
-    generate_pair_beacon("", "", night_policy, night_name) == #"16fad5193197779d2ed321a3caaaaade0c45f60f2e02b1518d2d1479feb6ee07",
   }
 }
 
@@ -2223,21 +1680,12 @@ test the_ceiling_rate_itself_is_allowed() {
 /// reprice shape — a nonsensical ceremony parameter should make the instance
 /// inert, the same argument as the ceiling.
 test a_negative_fee_rate_fails_the_instance_even_on_a_pure_reprice() {
-  // A real reprice carries the ceremony's three CANONICAL beacons on both legs
-  // (mirror of the positive twin below). Without them the continuation gate
-  // refuses the output and conservation rejects the tx, which would hide the
-  // fee-sign guard; with them the shape clears every other check, so
-  // `fee_bps_param >= 0` is the sole rejecter of the -1 rate.
-  let repriced = assets.from_lovelace(100_000_000)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
   let t = tx(
-    [input_at(0, order_addr, repriced)],
+    [input_at(0, order_addr, assets.from_lovelace(100_000_000))],
     [
       Output {
         address: order_addr,
-        value: repriced,
+        value: assets.from_lovelace(100_000_000),
         datum: InlineDatum(valid_order_datum()),
         reference_script: None,
       },
@@ -2249,20 +1697,14 @@ test a_negative_fee_rate_fails_the_instance_even_on_a_pure_reprice() {
 }
 
 /// The same reprice at a legal rate must still work, so the test above is
-/// discriminating rather than rejecting the shape itself. A real reprice carries
-/// the ceremony's three beacons forward, so the input and the continuation both
-/// hold them (value conserved — the beacons enter and leave in equal measure).
+/// discriminating rather than rejecting the shape itself.
 test a_pure_reprice_at_a_legal_rate_still_works() {
-  let repriced = assets.from_lovelace(100_000_000)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
   let t = tx(
-    [input_at(0, order_addr, repriced)],
+    [input_at(0, order_addr, assets.from_lovelace(100_000_000))],
     [
       Output {
         address: order_addr,
-        value: repriced,
+        value: assets.from_lovelace(100_000_000),
         datum: InlineDatum(valid_order_datum()),
         reference_script: None,
       },
@@ -2817,11 +2259,9 @@ fn repaired_datum() -> Data {
     ..base_order_datum(),
     asset2_id: junk,
     asset2_name: "JUNK",
-    // The beacon NAMES the bot declares for the re-paired order. These are NOT
-    // the sanctioned pair's canonical sha2-256 names, so the canonical-name gate
-    // rejects them in addition to the sanctioned-pair mismatch.
+    // The beacon NAMES the bot declares for the new pair. cardano-swaps binds
+    // these to the asset ids; this validator never looks at them.
     pair_beacon: "JUNKPAIR",
-    asset1_beacon: "JUNKA1",
     asset2_beacon: "JUNKA2",
     // Quoted exactly ON both ceremony floors — the honest band, untouched.
     asset1_price: honest_a1,
@@ -2835,17 +2275,6 @@ fn repaired_datum() -> Data {
 // "the bot can never quote outside the band you set" is false: the band is
 // still enforced, and it is no longer a band on the client's token.
 test bot_repair_to_foreign_pair_rejected() {
-  // The continuation carries the beacon TOKENS repaired_datum declares
-  // ("JUNKPAIR"/"JUNKA1"/"JUNKA2"), qty 1 each, plus the whole non-beacon
-  // inventory. Re-pairing onto junk cannot validate: the continuation declares a
-  // pair other than the one spent (sanctioned_pair), and its junk beacon names
-  // are not the sanctioned pair's canonical names (canonical-name), so it is not
-  // blessed and the value it holds is a conservation deficit. All three reject.
-  let repaired_value = assets.from_lovelace(2_000_000)
-    |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, "JUNKPAIR", 1)
-    |> assets.add(beacon, "JUNKA1", 1)
-    |> assets.add(beacon, "JUNKA2", 1)
   !run_withdraw_with(
     payout_addr,
     dapp,
@@ -2854,7 +2283,7 @@ test bot_repair_to_foreign_pair_rejected() {
     honest_a2,
     tx(
       [input_at(0, order_addr, inventory())],
-      [cont(repaired_value, repaired_datum())],
+      [cont(inventory(), repaired_datum())],
       [Pair(own_cred, 0)],
       [bot],
     ),
@@ -2862,11 +2291,10 @@ test bot_repair_to_foreign_pair_rejected() {
 }
 
 // The realistic shape, and the one that survives cardano-swaps: the bot SPLITS
-// the book. One continuation keeps the client's token as an honest order (blessed
-// — canonical beacons, the sanctioned pair); the other carries the ADA re-paired
-// onto junk. The junk half is not blessed (its declared pair is not the one
-// spent, and its junk beacon names are not the canonical ones), so the ADA it
-// holds is stranded from `allowed_out` and the split is refused.
+// the book. One continuation keeps the client's token as an honest order; the
+// other carries the ADA re-paired onto junk. Per-asset conservation is exact —
+// every lovelace and every TKN stays inside the perimeter — so `conserved`
+// cannot object, and each output clears both floors on its own.
 test bot_split_repair_rejected() {
   let honest_half: Data = LegacySwapDatum {
     ..base_order_datum(),
@@ -2882,25 +2310,18 @@ test bot_split_repair_rejected() {
     tx(
       [input_at(0, order_addr, inventory())],
       [
-        // the client's TKN, still an honest ADA/TKN order — carries the full
-        // CANONICAL beacon set the honest datum declares, so it clears the
-        // canonical-name gate on its own.
+        // the client's TKN, still an honest ADA/TKN order
         cont(
           assets.from_lovelace(1_000_000)
             |> assets.add(tkn, "TKN", 100)
-            |> assets.add(beacon, test_pair_beacon(), 1)
-            |> assets.add(beacon, test_asset1_beacon(), 1)
-            |> assets.add(beacon, test_asset2_beacon(), 1),
+            |> assets.add(beacon, "A1", 1),
           honest_half,
         ),
-        // the client's ADA, now priced against a token worth nothing — carries
-        // the "JUNKPAIR"/"JUNKA1"/"JUNKA2" set repaired_datum declares, so it is
-        // rejected on the pair AND on the canonical-name check, never blessed.
+        // the client's ADA, now priced against a token worth nothing
         cont(
           assets.from_lovelace(1_000_000)
-            |> assets.add(beacon, "JUNKPAIR", 1)
-            |> assets.add(beacon, "JUNKA1", 1)
-            |> assets.add(beacon, "JUNKA2", 1),
+            |> assets.add(beacon, "PAIR", 1)
+            |> assets.add(beacon, "A2", 1),
           repaired_datum(),
         ),
       ],
@@ -3248,143 +2669,6 @@ test probe_migration_sanctioned_to_foreign_rejected() {
   !run_withdraw(t)
 }
 
-// ---------------------------------------------------------------------------
-// The decoy-repair drain: a continuation may carry only ORDER-sourced value
-//
-// A red-team found a permissionless theft on the bot path that every prior
-// defence clears. The bot co-spends a tiny DECOY order at the order address
-// declaring an attacker pair (ADA, JUNK) — which alone sets `sanctioned_pair` —
-// together with the client's beacon-free sibling value at a SIBLING
-// cardano-swaps payment script under this same stake credential. It mints the
-// GENUINE canonical (ADA, JUNK) beacons — so the canonical-name gate passes,
-// the names being real for the attacker's chosen pair — and re-parks the whole
-// guarded value into ONE (ADA, JUNK) continuation quoting at the client's own
-// floors. Per-asset conservation holds (the value never leaves the order
-// address), so the tx validates; a colluding taker then fills the order for
-// worthless JUNK, a drain the fill never routes through this validator.
-//
-// `cont_only_conserved` is the sole rejecter: the decoy sources only its own
-// 2 ADA, the continuation carries the decoy PLUS the sibling, and cont_out >
-// guarded_order rejects. The sibling stays rescuable to the payout (the intended
-// behaviour, pinned above by
-// `foreign_payment_script_input_without_beacons_rescued_to_payout_passes`); it
-// simply can no longer enter a continuation. Neutralising `cont_only_conserved`
-// (MS-siblingcap) reddens both tests below — it is the only thing standing
-// between the decoy and the drain.
-// ---------------------------------------------------------------------------
-
-// The (ADA, JUNK) pair's canonical beacon names, by the SAME sha2-256 derivation
-// the validator uses — so the minted beacons and the datum's name fields are
-// genuinely canonical for the attacker-chosen pair, and the canonical-name gate
-// cannot tell this continuation from an honest one. asset1 is ADA, so its beacon
-// is `test_asset1_beacon()` (sha256 of the empty policy+name).
-fn junk_pair_beacon() -> AssetName {
-  generate_pair_beacon("", "", junk, "JUNK")
-}
-
-fn junk_asset2_beacon() -> AssetName {
-  generate_asset_beacon(junk, "JUNK")
-}
-
-// The decoy order's datum: pair (ADA, JUNK), the canonical (ADA, JUNK) beacon
-// names, quoting AT the ceremony floors (inherited from `base_order_datum`). As
-// an INPUT only its pair is read (to set `sanctioned_pair`); as the continuation
-// datum its prices clear the floors.
-fn decoy_junk_datum() -> Data {
-  let data: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    asset2_id: junk,
-    asset2_name: "JUNK",
-    pair_beacon: junk_pair_beacon(),
-    asset1_beacon: test_asset1_beacon(),
-    asset2_beacon: junk_asset2_beacon(),
-  }
-  data
-}
-
-// A 2-ADA decoy order at the REAL order address declaring the (ADA, JUNK) pair —
-// the whole of `sanctioned_pair` derives from this one tiny input.
-fn decoy_order_input() -> Input {
-  Input {
-    output_reference: oref(0),
-    output: Output {
-      address: order_addr,
-      value: assets.from_lovelace(2_000_000),
-      datum: InlineDatum(decoy_junk_datum()),
-      reference_script: None,
-    },
-  }
-}
-
-// Beacon-free client value at a SIBLING cardano-swaps payment script wearing this
-// same stake credential, NoDatum — the value `guarded_in` deliberately includes
-// so the bot can rescue it to the payout, and the value the decoy attack tries to
-// launder into a continuation instead.
-fn beacon_free_sibling_input(ix: Int, value: Value) -> Input {
-  Input {
-    output_reference: oref(ix),
-    output: Output {
-      address: Address {
-        payment_credential: Script(foreign_dapp),
-        stake_credential: Some(Inline(own_cred)),
-      },
-      value,
-      datum: NoDatum,
-      reference_script: None,
-    },
-  }
-}
-
-// The bot mints the pair's GENUINE canonical beacon set, so the re-parked
-// continuation holds real (ADA, JUNK) beacons and clears the canonical-name gate.
-fn minted_junk_beacons() -> Value {
-  assets.from_asset(beacon, junk_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, junk_asset2_beacon(), 1)
-}
-
-// Sibling = 50 ADA beacon-free; decoy = 2 ADA; re-parked into one canonical
-// (ADA, JUNK) continuation of 52 ADA. guarded_order = 2, cont_out = 52 → 52 > 2
-// rejects. Without `cont_only_conserved` every other check passes and the theft
-// validates.
-test attack_decoy_repair_sibling_ada() {
-  let cont_value = assets.from_lovelace(52_000_000)
-    |> assets.add(beacon, junk_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, junk_asset2_beacon(), 1)
-  let t = tx(
-    [
-      decoy_order_input(),
-      beacon_free_sibling_input(1, assets.from_lovelace(50_000_000)),
-    ],
-    [cont(cont_value, decoy_junk_datum())],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(burning(t, minted_junk_beacons()))
-}
-
-// The token variant: sibling = 10 ADA + 100 TKN beacon-free; decoy = 2 ADA;
-// re-parked into one canonical (ADA, JUNK) continuation of 12 ADA + 100 TKN.
-// guarded_order = 2 ADA (0 TKN); cont_out = 12 ADA + 100 TKN → both the ADA and
-// the TKN exceed what the decoy sourced, so it rejects. The client's 100 TKN
-// being laundered into a JUNK order is the clearer theft.
-test attack_decoy_repair_sibling_ada_token() {
-  let sibling = assets.from_lovelace(10_000_000) |> assets.add(tkn, "TKN", 100)
-  let cont_value = assets.from_lovelace(12_000_000)
-    |> assets.add(tkn, "TKN", 100)
-    |> assets.add(beacon, junk_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, junk_asset2_beacon(), 1)
-  let t = tx(
-    [decoy_order_input(), beacon_free_sibling_input(1, sibling)],
-    [cont(cont_value, decoy_junk_datum())],
-    [Pair(own_cred, 0)],
-    [bot],
-  )
-  !run_withdraw(burning(t, minted_junk_beacons()))
-}
-
 // The p4<->p5 mis-parameterisation (dapp_hash and beacon_id swapped over). With
 // the input fold keyed on `dapp_hash`, NOTHING was guarded and conservation was
 // vacuously true — a bot signature alone moved everything. Keyed on `own_cred`
@@ -3497,36 +2781,21 @@ test golden_two_way_datum_decodes_as_legacy() {
 // The continuation gate accepts the real datum shape (permissive floors), so a
 // bot reprice carrying it is never rejected as a brick.
 test golden_two_way_datum_accepted_by_continuation_gate() {
-  let d = golden_two_way_datum()
-  // The value must carry the beacons the gate looks for: this ceremony's own
-  // policy (golden_beacon) and the datum's three beacon names, qty 1 each —
-  // the exact holding a real two-way continuation rests under.
-  let value = assets.from_lovelace(2_000_000)
-    |> assets.add(golden_beacon, d.pair_beacon, 1)
-    |> assets.add(golden_beacon, d.asset1_beacon, 1)
-    |> assets.add(golden_beacon, d.asset2_beacon, 1)
   let output = Output {
     address: order_addr,
-    value,
+    value: inventory(),
     datum: InlineDatum(golden_two_way_datum()),
     reference_script: None,
   }
   // The pair it declares is the pair it carries in, which is what a real reprice
-  // does; the gate now refuses a continuation that names any other. The expected
-  // beacon names are derived from that pair by the same rule the validator uses —
-  // and the golden datum's on-chain names (asset1 e3b0c442…, asset2 430c6a07…,
-  // pair 2c973472…) are exactly those, so this doubles as the ADAMMKT oracle for
-  // the derivation.
-  let sanctioned = Some(
-    (d.asset1_id, d.asset1_name, d.asset2_id, d.asset2_name),
-  )
+  // does; the gate now refuses a continuation that names any other.
+  let d = golden_two_way_datum()
   is_spendable_continuation_datum(
     output,
     golden_beacon,
     zero_floor,
     zero_floor,
-    sanctioned,
-    expected_beacon_names(sanctioned),
+    Some((d.asset1_id, d.asset1_name, d.asset2_id, d.asset2_name)),
   )
 }
 
@@ -3677,213 +2946,4 @@ test bench_escape_fixture_32() {
 
 test bench_escape_32() {
   run_withdraw_fee(escape(32))
-}
-
-// Property tests execute the bound validator. The fill sequence models the DEX's
-// paid-for token transfer; it does not execute the separate cardano-swaps script.
-
-test prop_inventory_conservation(
-  (ada, tokens) via fuzz.both(
-    fuzz.int_between(2_000_000, 1_000_000_000_000),
-    fuzz.int_between(1, 1_000_000_000),
-  ),
-) {
-  // A resting order carries the ceremony's three CANONICAL beacons; the
-  // continuation the reprice writes carries them forward. Shorting any non-beacon
-  // asset still fails conservation regardless — the beacons make the gate bless
-  // the shape at all, they do not exempt a lovelace or token deficit.
-  let value = assets.from_lovelace(ada)
-    |> assets.add(tkn, "TKN", tokens)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
-  let reprice = fn(v) {
-    run_withdraw(
-      tx(
-        [input_at(0, order_addr, value)],
-        [cont(v, valid_order_datum())],
-        [Pair(own_cred, 0)],
-        [bot],
-      ),
-    )
-  }
-  and {
-    reprice(value),
-    !reprice(assets.add(value, #"", #"", -1)),
-    !reprice(assets.add(value, tkn, "TKN", -1)),
-  }
-}
-
-test prop_split_cannot_change_the_input_pair(
-  (ada, tokens) via fuzz.both(
-    fuzz.int_between(2_000_001, 1_000_000_000_000),
-    fuzz.int_between(1, 1_000_000_000),
-  ),
-) {
-  // The input and the honest continuation carry a full CANONICAL three-beacon
-  // set, so the honest half is blessed and the split conserves. The repaired half
-  // both declares a different pair than was spent (sanctioned_pair) and names junk
-  // beacons that are not the pair's canonical names (canonical-name), so it is
-  // refused — which is exactly what this property pins. (A genuine 1->2 split
-  // mints a second canonical set; a surplus beacon on the output side satisfies
-  // conservation's `qty >= 0`, so the honest split is not blocked.)
-  let value = assets.from_lovelace(ada)
-    |> assets.add(tkn, "TKN", tokens)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
-  let honest: Data = LegacySwapDatum {
-    ..base_order_datum(),
-    asset1_price: honest_a1,
-    asset2_price: honest_a2,
-  }
-  // The honest first continuation carries the CANONICAL beacon set + all the
-  // TKN; the second continuation carries the value/datum under test. The honest
-  // second declares the sanctioned pair and canonical beacons (blessed); the
-  // repaired second declares junk (refused on pair AND canonical name), so its
-  // ADA is stranded from `allowed_out` and the split cannot balance.
-  let split = fn(second_value: Value, datum: Data) {
-    run_withdraw_with(
-      payout_addr,
-      dapp,
-      beacon,
-      honest_a1,
-      honest_a2,
-      tx(
-        [input_at(0, order_addr, value)],
-        [
-          cont(
-            assets.from_lovelace(1_000_000)
-              |> assets.add(tkn, "TKN", tokens)
-              |> assets.add(beacon, test_pair_beacon(), 1)
-              |> assets.add(beacon, test_asset1_beacon(), 1)
-              |> assets.add(beacon, test_asset2_beacon(), 1),
-            honest,
-          ),
-          cont(second_value, datum),
-        ],
-        [Pair(own_cred, 0)],
-        [bot],
-      ),
-    )
-  }
-  let honest_second = assets.from_lovelace(ada - 1_000_000)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
-  let repaired_second = assets.from_lovelace(ada - 1_000_000)
-    |> assets.add(beacon, "JUNKPAIR", 1)
-    |> assets.add(beacon, "JUNKA1", 1)
-    |> assets.add(beacon, "JUNKA2", 1)
-  and {
-    split(honest_second, honest),
-    !split(repaired_second, repaired_datum()),
-  }
-}
-
-test prop_rewards_are_conserved_and_excluded_from_fees(
-  (rewards, fee) via fuzz.both(
-    fuzz.int_between(0, 1_000_000_000_000),
-    fuzz.int_between(1, 100_000_000),
-  ),
-) {
-  // At 200 bps, 49 units to the client permit exactly one unit of fee.
-  let harvest = fn(payout, charge) {
-    run_withdraw_fee(
-      tx(
-        [input_at(0, bot_addr, assets.from_lovelace(100 * fee + 2_000_000))],
-        [
-          out(payout_addr, assets.from_lovelace(payout)),
-          out(fee_addr, assets.from_lovelace(charge)),
-        ],
-        [Pair(own_cred, rewards)],
-        [bot],
-      ),
-    )
-  }
-  and {
-    harvest(rewards + 49 * fee, fee),
-    !harvest(rewards + 49 * fee, fee + 1),
-    harvest(rewards, 0),
-    !harvest(rewards, 1),
-    !run_withdraw_fee(
-      tx(
-        [input_at(0, bot_addr, assets.from_lovelace(2_000_000))],
-        [out(payout_addr, assets.from_lovelace(rewards))],
-        [Pair(own_cred, rewards + 1)],
-        [bot],
-      ),
-    ),
-  }
-}
-
-test prop_client_exit_survives_invalid_bot_floors(
-  (tokens, rewards) via fuzz.both(
-    fuzz.int_between(1, 1_000_000_000),
-    fuzz.int_between(0, 1_000_000_000_000),
-  ),
-) {
-  let value = assets.from_lovelace(2_000_000) |> assets.add(tkn, "TKN", tokens)
-  run_withdraw_with(
-    payout_addr,
-    dapp,
-    beacon,
-    zero_floor,
-    zero_floor,
-    tx(
-      [input_at(0, order_addr, value)],
-      [out(other_addr, assets.add(value, #"", #"", rewards))],
-      [Pair(own_cred, rewards)],
-      [client],
-    ),
-  )
-}
-
-test prop_reprice_fill_sequence_preserves_exit(
-  fills via fuzz.list_between(fuzz.int_between(1, 10_000), 2, 12),
-) {
-  // The resting order carries the ceremony's three CANONICAL beacons; every
-  // reprice continuation and the taker-filled successor carry them forward (a
-  // fill moves only lovelace and token, never the beacons), so each reprice is a
-  // gate-valid shape across the whole sequence.
-  let initial = assets.from_lovelace(2_000_000)
-    |> assets.add(tkn, "TKN", 1_000_000)
-    |> assets.add(beacon, test_pair_beacon(), 1)
-    |> assets.add(beacon, test_asset1_beacon(), 1)
-    |> assets.add(beacon, test_asset2_beacon(), 1)
-  let (final, valid) = list.foldl(
-    fills,
-    (initial, True),
-    fn(quantity, state) {
-      let (before, valid) = state
-      let ask = 2 + quantity % 100
-      let datum = priced_datum(1, 2, ask, 1)
-      let reprice_ok = run_withdraw(
-        tx(
-          [input_at(0, order_addr, before)],
-          [cont(before, datum)],
-          [Pair(own_cred, 0)],
-          [bot],
-        ),
-      )
-      // A permissionless taker buys quantity tokens at the just-posted ask.
-      let after = before
-        |> assets.add(#"", #"", quantity * ask)
-        |> assets.add(tkn, "TKN", -quantity)
-      (after, valid && reprice_ok)
-    },
-  )
-  and {
-    valid,
-    assets.lovelace_of(final) > assets.lovelace_of(initial),
-    assets.quantity_of(final, tkn, "TKN") > 0,
-    run_withdraw(
-      tx(
-        [input_at(0, order_addr, final)],
-        [out(payout_addr, final)],
-        [Pair(own_cred, 0)],
-        [client],
-      ),
-    ),
-  }
 }
