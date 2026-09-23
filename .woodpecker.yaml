@@ -1,0 +1,22 @@
+# The gates live in verify_project.sh, which fetches and checksums its own
+# pinned Aiken, cardano-cli and upstream blueprint; this step only supplies a
+# userland.
+
+when:
+  - event: pull_request
+  - event: push
+    branch: main
+  - event: manual
+
+steps:
+  - name: verify
+    image: debian:bookworm-slim
+    commands:
+      # xxd: escape.test.sh reads the last byte of a file through it, and it is
+      # Priority: optional in bookworm, so a slim image does not carry it.
+      - apt-get update -qq && apt-get install -yqq --no-install-recommends curl ca-certificates git python3 python3-pip xxd > /dev/null
+      # The clone step and this one run as different users; without this, git
+      # refuses the checkout and the committed-blueprint gate turns into a
+      # fatal instead of a verdict.
+      - git config --global --add safe.directory '*'
+      - bash verify_project.sh
