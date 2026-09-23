@@ -10,10 +10,10 @@
 # the workspace and to whatever the two suites that judge the validator import
 # from.
 #
-# WHEELS ONLY, and therefore x86_64 linux on CPython 3.11 or 3.12 — the two
-# interpreters our runners have (Debian bookworm ships 3.11, GitHub's
-# ubuntu-latest ships 3.12). cffi publishes one wheel per interpreter, so a
-# third Python has no pinned artifact here and pip must say so loudly. The
+# WHEELS ONLY, and therefore x86_64 linux on CPython 3.11 or 3.12 — Debian
+# bookworm (the CI image) ships 3.11 and Ubuntu 24.04 ships 3.12. cffi
+# publishes one wheel per interpreter, so a third Python has no pinned
+# artifact here and pip must say so loudly. The
 # sdists are deliberately NOT pinned: with them present pip answers an
 # unsupported interpreter by compiling C in an image that has no compiler, which
 # fails slowly and reads as an infrastructure fault rather than a missing pin.
@@ -29,7 +29,7 @@ pynacl==1.5.0 \
     --hash=sha256:0c84947a22519e013607c9be43706dd42513f9e6ae5d39d3613ca1e142fba44d \
     --hash=sha256:06b8f6fa7f5de8d5d2f7573fe8c863c051225a27b61e6860fd047b1775807858
 
-# Interpreter-specific: cp311 (Debian bookworm) and cp312 (ubuntu-latest).
+# Interpreter-specific: cp311 (Debian bookworm) and cp312 (Ubuntu 24.04).
 cffi==1.17.1 \
     --hash=sha256:610faea79c43e44c71e1ec53a554553fa22321b65fae24889706c0a84d4ad86d \
     --hash=sha256:b62ce867176a75d03a665bad002af8e6d54644fad99a3c70905c543130e39d93

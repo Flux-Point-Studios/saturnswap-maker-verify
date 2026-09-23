@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Every gate that judges maker_stake, in one runnable place.
 #
-# This is what CI runs — GitHub Actions and Woodpecker both call it and add
-# nothing of their own — and it is what a developer runs before pushing. One
-# copy, because the alternative is two CI files each carrying its own copy of
-# the Aiken checksum, the validator hash pin, and the upstream cardano-swaps
-# commit, drifting apart until the pins stop meaning anything.
+# This is what CI runs — the Woodpecker pipeline calls it and adds nothing of
+# its own — and it is what a developer runs before pushing. One copy, because
+# the alternative is CI files each carrying its own copy of the Aiken checksum,
+# the validator hash pin, and the upstream cardano-swaps commit, drifting apart
+# until the pins stop meaning anything.
 #
 # Everything it fetches is checked against a pinned SHA256 before use. That is
 # not ceremony: this script's whole purpose is to say which bytes a client's
