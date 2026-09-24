@@ -66,6 +66,7 @@ import sys
 import tempfile
 import textwrap
 import tomllib
+from datetime import datetime
 from decimal import Decimal, localcontext
 from fractions import Fraction
 
@@ -1014,8 +1015,10 @@ _COSE_KEY_PREFIX = b"\xa4\x01\x01\x03\x27\x20\x06\x21\x58\x20"
 
 
 def canonical_possession_payload(challenge, network, params, band):
-    """The exact bytes a wallet must sign. Every line is re-derived here from the
-    ceremony this run verified, so a payload naming anything else cannot match.
+    """The v1 statement, rebuilt only to audit a v1 proof. It never says "I consent", so
+    this tool no longer offers it for signing and the keeper does not accept it. Every line
+    is re-derived here from the ceremony this run verified, so a payload naming anything
+    else cannot match.
 
     The challenge alone would bind the ceremony cryptographically — it already
     commits to the network, the unapplied validator and all nine parameters, and
@@ -1036,6 +1039,167 @@ def canonical_possession_payload(challenge, network, params, band):
         f"your band: {band}\n"
         f"challenge: {challenge.hex()}\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# The v2 consent statement (D2 spec 2.1, 2.3, 3.3 and section 11). ONE-WAY once a client
+# signs it: the keeper and the page rebuild these bytes from the ceremony and the values the
+# client signed, and refuse anything else, so a changed character is a v3 and a re-sign.
+# ---------------------------------------------------------------------------
+
+CONSENT_V2_HEADER = "SaturnSwap MMaaS consent, version 2"
+CONSENT_V2_SENTENCE = ("I consent to SaturnSwap making a market in my token with its bot key, "
+                       "on the terms below.")
+CONSENT_V2_MAX_BYTES = 2048
+CONSENT_V2_MAX_DECIMALS = 18
+_READABLE_ASSET_NAME = re.compile(rb"[0-9A-Za-z._-]{1,32}")
+
+
+class ConsentStatementRefused(CeremonyError):
+    """A v2 statement that breaks a rule of the canonical form. `rule` names it (spec 3.3.1 to
+    3.3.5), so every implementation can be held to refusing a variant for the same reason."""
+
+    def __init__(self, rule, detail):
+        super().__init__(f"this is not a canonical v2 consent statement: {detail}")
+        self.rule = rule
+
+
+def _bps(value):
+    return f"{value} bps ({_exact_decimal(Fraction(value, 100))}%)"
+
+
+def canonical_consent_payload_v2(challenge, network, params, consent):
+    """The one v2 statement this ceremony and these client values produce.
+
+    `consent` is {token: {policyId, assetNameHex}, decimals, terms: {spreadBps, maxDepthAda,
+    dailyLossBps, minRepriceBps}, signedAt}: what --consent-terms reads, what the parser
+    returns and what --json-out reports. The price limits are params 5 and 6 read at the
+    SIGNED decimals, so no caller can pair a statement with a band read at other decimals.
+    This renders; parse_consent_payload_v2 judges, and nothing is offered for signing that
+    it has not accepted."""
+    low, high = (_exact_decimal(v) for v in _band_ada_per_token(params, consent["decimals"]))
+    if low is None or high is None:
+        raise CeremonyError(
+            f"this ceremony's price limits have no exact decimal at {consent['decimals']} "
+            f"decimals, so no v2 statement exists for it: a rounded limit would be a second "
+            f"spelling of the band")
+    token = consent["token"]
+    try:
+        name = bytes.fromhex(token["assetNameHex"])
+    except ValueError:
+        raise CeremonyError(f"asset name hex {token['assetNameHex']!r} is not hexadecimal")
+    if not name:
+        token_line = f"policy {token['policyId']}, empty asset name"
+    elif _READABLE_ASSET_NAME.fullmatch(name):
+        token_line = (f"{name.decode('ascii')} (policy {token['policyId']}, "
+                      f"asset name hex {token['assetNameHex']})")
+    else:
+        token_line = f"policy {token['policyId']}, asset name hex {token['assetNameHex']}"
+    terms = consent["terms"]
+    return (
+        f"{CONSENT_V2_HEADER}\n"
+        f"{CONSENT_V2_SENTENCE}\n"
+        f"network: {network}\n"
+        f"your wallet: {params['client_payout_address']}\n"
+        f"our bot key: {_hash28('adam_bot_pkh', params['adam_bot_pkh']).hex()}\n"
+        f"our fee: at most {_bps(params['fee_bps'])} of the ADA we pay out to your wallet, "
+        f"none when we close your order\n"
+        f"your price limits: your book never buys above {low} or sells below {high} "
+        f"ADA per token\n"
+        f"your token: {token_line}\n"
+        f"token decimals: {consent['decimals']}\n"
+        f"spread: {_bps(terms['spreadBps'])} between your book's buying and selling prices\n"
+        f"book value cap: {terms['maxDepthAda']} ADA (your ADA plus your tokens at our price); "
+        f"above it we return the book to your wallet\n"
+        f"daily loss limit: {_bps(terms['dailyLossBps'])} of your book's value at the start of "
+        f"each UTC day; past it we return the book to your wallet\n"
+        f"reprice after our price moves: {_bps(terms['minRepriceBps'])}\n"
+        f"signed at: {consent['signedAt']}\n"
+        f"challenge: {challenge.hex()}\n"
+    )
+
+
+_V2_INT = "(0|[1-9][0-9]*)"
+_V2_POLICY = "([0-9a-f]{56})"
+_V2_NAME = "((?:[0-9a-f]{2}){1,32})"
+# Lines 8 to 14, the ones the client chooses. Each pattern pins the line's label and the value
+# it carries; the rest of the line is fixed text that the rebuild (3.3.5) compares byte for
+# byte. The readable name is not parsed at all: the rebuild derives it from the name bytes.
+_V2_CLIENT_LINES = (
+    re.compile(rf"your token: (?:.+ \(policy {_V2_POLICY}, asset name hex {_V2_NAME}\)"
+               rf"|policy {_V2_POLICY}, asset name hex {_V2_NAME}"
+               rf"|policy {_V2_POLICY}, empty asset name)"),
+    re.compile(rf"token decimals: {_V2_INT}"),
+    re.compile(rf"spread: {_V2_INT} bps .*"),
+    re.compile(rf"book value cap: {_V2_INT} ADA .*"),
+    re.compile(rf"daily loss limit: {_V2_INT} bps .*"),
+    re.compile(rf"reprice after our price moves: {_V2_INT} bps .*"),
+    re.compile(r"signed at: ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)"),
+)
+
+
+def parse_consent_payload_v2(payload, challenge, network, params):
+    """The client values a v2 statement carries, once it is the canonical statement for this
+    ceremony (spec 3.3). Raises ConsentStatementRefused naming the first rule it breaks.
+    Bounds are not judged here: this answers what the client signed, and the bounds are the
+    keeper's policy (spec 3.4)."""
+    if len(payload) > CONSENT_V2_MAX_BYTES:
+        raise ConsentStatementRefused(
+            "3.3.1", f"it is {len(payload):,} bytes; a v2 statement is at most "
+                     f"{CONSENT_V2_MAX_BYTES:,}")
+    for offset, byte in enumerate(payload):
+        if byte != 0x0A and not 0x20 <= byte <= 0x7E:
+            raise ConsentStatementRefused(
+                "3.3.1", f"byte 0x{byte:02x} at offset {offset} is not printable ASCII or a "
+                         f"line feed")
+    lines = payload.decode("ascii").split("\n")
+    if len(lines) != 16 or lines[15] != "":
+        raise ConsentStatementRefused(
+            "3.3.2", f"it has {len(lines) - 1} line feeds; a v2 statement is exactly 15 lines, "
+                     f"each ending in one")
+    for number, line in enumerate(lines[:15], start=1):
+        if line.endswith(" "):
+            raise ConsentStatementRefused("3.3.2", f"line {number} ends in a space")
+    if lines[0] != CONSENT_V2_HEADER or lines[1] != CONSENT_V2_SENTENCE:
+        raise ConsentStatementRefused(
+            "3.3.3", "lines 1 and 2 are not the v2 header and consent sentence, byte for byte")
+    found = []
+    for number, (pattern, line) in enumerate(zip(_V2_CLIENT_LINES, lines[7:14]), start=8):
+        match = pattern.fullmatch(line)
+        if match is None:
+            raise ConsentStatementRefused(
+                "3.3.4", f"line {number} does not read as line {number} of the v2 template: "
+                         f"{line!r}")
+        found.append(match)
+    token, decimals, spread, cap, loss, reprice, signed = found
+    decimals = int(decimals.group(1))
+    if decimals > CONSENT_V2_MAX_DECIMALS:
+        raise ConsentStatementRefused(
+            "3.3.4", f"token decimals {decimals} is above {CONSENT_V2_MAX_DECIMALS}")
+    signed_at = signed.group(1)
+    try:
+        datetime.strptime(signed_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ConsentStatementRefused("3.3.4", f"signed at {signed_at} is not a real UTC instant")
+    consent = {
+        "token": {"policyId": token.group(1) or token.group(3) or token.group(5),
+                  "assetNameHex": token.group(2) or token.group(4) or ""},
+        "decimals": decimals,
+        "terms": {"spreadBps": int(spread.group(1)), "maxDepthAda": int(cap.group(1)),
+                  "dailyLossBps": int(loss.group(1)), "minRepriceBps": int(reprice.group(1))},
+        "signedAt": signed_at,
+    }
+    rebuilt = canonical_consent_payload_v2(challenge, network, params, consent)
+    if rebuilt.encode() != payload:
+        raise ConsentStatementRefused(
+            "3.3.5", "it is not the one statement this ceremony and the values it names "
+                     "produce. It reads:\n\n"
+                     + textwrap.indent(payload.decode("ascii"), "    ")
+                     + "\n  and this ceremony, with those values, produces:\n\n"
+                     + textwrap.indent(rebuilt, "    ")
+                     + "\n  A statement signed for another ceremony, or spelled any other way, "
+                       "cannot stand for this one")
+    return consent
 
 
 def load_cip30_proof(doc, path):
@@ -1402,21 +1566,35 @@ def load_params(path):
     return doc
 
 
+def _exact_decimal(value):
+    """A Fraction as its terminating decimal with trailing zeros stripped, or None when it
+    has none. Exact at any length: the v2 statement is rebuilt byte for byte in TypeScript,
+    where a rounded digit would be a second spelling of the same value."""
+    den, twos, fives = value.denominator, 0, 0
+    while den % 2 == 0:
+        den, twos = den // 2, twos + 1
+    while den % 5 == 0:
+        den, fives = den // 5, fives + 1
+    if den != 1:
+        return None
+    places = max(twos, fives)
+    scaled = value * 10 ** places
+    digits = str(abs(scaled.numerator)).rjust(places + 1, "0")
+    whole, frac = digits[:len(digits) - places], digits[len(digits) - places:].rstrip("0")
+    return ("-" if scaled < 0 else "") + whole + ("." + frac if frac else "")
+
+
 def _decimal_str(value):
     """A Fraction as an exact decimal string where it has one, otherwise six
     significant digits marked with '≈'. Display only — every comparison in this
     file is done on the exact Fractions."""
-    den = value.denominator
-    while den % 2 == 0:
-        den //= 2
-    while den % 5 == 0:
-        den //= 5
-    exact = den == 1
+    exact = _exact_decimal(value)
+    if exact is not None:
+        return exact
     with localcontext() as ctx:
-        ctx.prec = 40 if exact else 6
-        text = format(
+        ctx.prec = 6
+        return "≈" + format(
             (Decimal(value.numerator) / Decimal(value.denominator)).normalize(), "f")
-    return text if exact else "≈" + text
 
 
 def parse_band_anchor(text):
@@ -1460,6 +1638,17 @@ def contracted_fee_ceiling_bps(project=None):
             f"{path} declares no `const max_fee_bps: Int`; this tool will not guess the "
             f"ceiling the validator enforces")
     return int(found.group(1))
+
+
+def _band_ada_per_token(doc, decimals):
+    """(bid ceiling, ask floor) in ADA per whole token, exactly. min_asset1_price is
+    token-per-lovelace, so it caps the bid at its inverse; min_asset2_price floors the ask."""
+    a1n, a1d = _rational("min_asset1_price", doc["min_asset1_price"])
+    a2n, a2d = _rational("min_asset2_price", doc["min_asset2_price"])
+    _reject_non_positive_floor("min_asset1_price", a1n, a1d)
+    _reject_non_positive_floor("min_asset2_price", a2n, a2d)
+    scale = Fraction(10) ** decimals / LOVELACE_PER_ADA
+    return Fraction(a1d, a1n) * scale, Fraction(a2n, a2d) * scale
 
 
 def check_ceremony_coherence(doc, payout_info, decimals, anchor, project=None):
@@ -1548,9 +1737,7 @@ def check_ceremony_coherence(doc, payout_info, decimals, anchor, project=None):
     # anchor the level: the floors are raw base units and the token's decimals
     # are not on chain. So the anchor is a client input, and without it this
     # tool asserts nothing about either floor's magnitude.
-    scale = Fraction(10) ** decimals / LOVELACE_PER_ADA
-    bid_ceiling = Fraction(a1d, a1n) * scale
-    ask_floor = Fraction(a2n, a2d) * scale
+    bid_ceiling, ask_floor = _band_ada_per_token(doc, decimals)
     band = {
         "bid_ceiling_lovelace_per_base_unit": f"{a1d}/{a1n}",
         "ask_floor_lovelace_per_base_unit": f"{a2n}/{a2d}",
