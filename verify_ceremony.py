@@ -1595,8 +1595,8 @@ def load_consent_terms(path):
             doc = json.load(fh)
     except FileNotFoundError:
         raise CeremonyError(f"consent terms file not found: {path}")
-    except json.JSONDecodeError as exc:
-        raise CeremonyError(f"consent terms file {path} is not valid JSON: {exc}")
+    except ValueError as exc:
+        raise CeremonyError(f"consent terms file {path} cannot be read as JSON: {exc}")
 
     def check(value, shape, where):
         if isinstance(shape, dict):

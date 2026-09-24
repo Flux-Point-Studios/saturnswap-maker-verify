@@ -279,6 +279,16 @@ class ConsentTermsFile(unittest.TestCase):
                 with self.assertRaisesRegex(vc.CeremonyError, "exactly"):
                     self.load(bad)
 
+    def test_an_integer_too_long_to_read_is_refused_rather_than_crashing(self):
+        """json.load raises a bare ValueError, not JSONDecodeError, for an integer longer than
+        sys.get_int_max_str_digits(), and the tool reports only CeremonyError as a refusal."""
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            fh.write('{"decimals": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}")
+        self.addCleanup(os.unlink, fh.name)
+        with self.assertRaisesRegex(vc.CeremonyError, "cannot be read as JSON"):
+            vc.load_consent_terms(fh.name)
+
     def test_a_value_of_the_wrong_type_is_refused(self):
         consent = load_golden()["cases"][0]["consent"]
         for bad in (dict(consent, decimals=True), dict(consent, decimals="6"),

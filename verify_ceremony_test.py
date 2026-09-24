@@ -2532,5 +2532,42 @@ class ConsentV2ProofEndToEnd(unittest.TestCase):
         self.assertIsNone(js["consent_terms"])
 
 
+NIGHT_V1_RECORD = json.load(open(os.path.join(HERE, "testdata", "mainnet-night-v1-consent.json")))
+NIGHT_PARAMS = json.load(open(os.path.join(HERE, "testdata", "consent-v2.golden.json")))["ceremony"]["params"]
+# The credential the live NIGHT order sits under (D2 spec section 7, read from Kupo).
+NIGHT_LIVE_CREDENTIAL = "ae354eef546c4b1052534470e0d0d989d343b7d963bc85243b335f0b"
+
+
+class ConsentV1ProofEndToEnd(unittest.TestCase):
+    """The live NIGHT book's own on-chain consent, which its client's wallet signed over the v1
+    statement. It still proves the escape-hatch key, and the tool says it consents to nothing."""
+
+    def test_the_live_night_v1_record_proves_the_key_and_is_reported_audit_only(self):
+        record = NIGHT_V1_RECORD["metadata"]
+        address, cose_sign1, cose_key = ("".join(record[key]) for key in ("addr", "sig", "key"))
+        self.assertEqual(record["n"], [len(address), len(cose_sign1), len(cose_key)])
+        self.assertEqual(address, NIGHT_PARAMS["client_payout_address"])
+        tmp = tempfile.mkdtemp(prefix="mmaas-consent-v1-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        proof = os.path.join(tmp, "possession-proof.json")
+        with open(proof, "w") as fh:
+            json.dump({"type": "CIP30PossessionProof", "address": address,
+                       "coseSign1": cose_sign1, "coseKey": cose_key}, fh)
+        ceremony = dict(network="mainnet", decimals=6, band="0.09:0.11", vkey=None, proof=None)
+        _, _, _, derived = run_tool(NIGHT_PARAMS, extra=["--derive-only"], **ceremony)
+        self.assertEqual(derived["derived"]["applied_script_hash"], NIGHT_LIVE_CREDENTIAL)
+
+        rc, out, err, js = run_tool(NIGHT_PARAMS, **ceremony, extra=[
+            "--possession-proof", proof, "--my-address", address,
+            "--expect-order-address", derived["derived"]["order_address"]])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(js["verdict"], "verified")
+        self.assertEqual(js["possession"]["statement"], "v1, audit only, not accepted by the keeper")
+        self.assertIsNone(js["consent_terms"])
+        self.assertIn("v1, audit only, not accepted by the keeper", out)
+        self.assertIn("consents to nothing", out)
+        self.assertNotIn("You consented to:", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
