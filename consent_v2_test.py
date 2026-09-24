@@ -6,6 +6,10 @@ is the reference. Two inputs here do not come from that renderer, and they are w
 golden worth pinning to: the statement text deci approved (spec 2.2 with the section 11
 daily-loss line), written out below by hand, and the live NIGHT ceremony's parameters and
 challenges, captured from the mainnet artefact.
+
+The same generator emits consent-v2.edges.golden.json, which pins what that golden leaves open:
+signed-at years 0000 to 0100, and token decimals other than 6. Its epoch seconds and price
+limits are also written out below by hand.
 """
 import importlib.util
 import json
@@ -19,6 +23,7 @@ import verify_ceremony as vc  # noqa: E402
 
 GOLDEN_PATH = os.path.join(HERE, "testdata", "consent-v2.golden.json")
 GENERATOR_PATH = os.path.join(HERE, "tools", "gen_consent_v2_golden.py")
+EDGES_PATH = os.path.join(HERE, "testdata", "consent-v2.edges.golden.json")
 
 # Spec 2.2, approved 2026-09-24 (section 11) with exactly one change: the daily-loss line, in
 # basis points of the book's day-open value. 500 is the section 11 default for dailyLossBps.
@@ -70,10 +75,38 @@ REQUIRED_VARIANTS = {
     "altered consent sentence",
 }
 
+# Proleptic-Gregorian epoch seconds, as GNU date and JavaScript's Date.parse give them.
+# Date.UTC reads years 0 to 99 as 1900 to 1999, so it is wrong for the first three.
+EARLY_SIGNED_AT_UNIX = {
+    "0001-01-01T00:00:00Z": -62135596800,
+    "0050-06-15T00:00:00Z": -60575040000,
+    "0099-12-31T23:59:59Z": -59011459201,
+    "0100-01-01T00:00:00Z": -59011459200,
+}
+
+# Worked by hand from each band: lovelace per base unit times 10^decimals / 10^6 ADA per token.
+PRICE_LIMITS_AT_DECIMALS = {
+    0: "your price limits: your book never buys above 0.00000025 or sells below 0.0000003 ADA per token",
+    2: "your price limits: your book never buys above 12.5 or sells below 13.0625 ADA per token",
+    18: "your price limits: your book never buys above 0.35 or sells below 0.3625 ADA per token",
+}
+
 
 def load_golden():
     with open(GOLDEN_PATH) as fh:
         return json.load(fh)
+
+
+def load_edges():
+    with open(EDGES_PATH) as fh:
+        return json.load(fh)
+
+
+def load_generator():
+    spec = importlib.util.spec_from_file_location("gen_consent_v2_golden", GENERATOR_PATH)
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    return generator
 
 
 def ceremony_of(golden):
@@ -97,11 +130,12 @@ class GoldenIsTheVerifierOutput(unittest.TestCase):
     def test_the_generator_reproduces_the_committed_golden_byte_for_byte(self):
         """A golden someone edited by hand pins the other repos to text this renderer does not
         produce, and every client signing through the page would then be refused here."""
-        spec = importlib.util.spec_from_file_location("gen_consent_v2_golden", GENERATOR_PATH)
-        generator = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(generator)
         with open(GOLDEN_PATH) as fh:
-            self.assertEqual(generator.emit(), fh.read())
+            self.assertEqual(load_generator().emit(), fh.read())
+
+    def test_the_generator_reproduces_the_committed_edges_byte_for_byte(self):
+        with open(EDGES_PATH) as fh:
+            self.assertEqual(load_generator().emit_edges(), fh.read())
 
 
 class TheGoldenCeremonyIsTheLiveNightBook(unittest.TestCase):
@@ -253,6 +287,104 @@ class Parse(unittest.TestCase):
         with self.assertRaises(vc.ConsentStatementRefused) as caught:
             vc.parse_consent_payload_v2(SPEC_2_2_NIGHT.encode(), other, network, params)
         self.assertEqual(caught.exception.rule, "3.3.5")
+
+
+class EdgesTheGoldenLeavesOpen(unittest.TestCase):
+    """consent-v2.edges.golden.json. Every case of the main golden is signed in 2026 at decimals
+    6, where the price-limits line prints params 5 and 6 as they are; a TypeScript port can pass
+    all of it and still misread an early year or a token with other decimals."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.golden = load_golden()
+        cls.edges = load_edges()
+        cls.night = next(c for c in cls.golden["cases"] if c["tokenLineForm"] == "readable")
+
+    def accepted(self):
+        """(label, the document holding the ceremony it was rendered over, case)."""
+        for case in self.edges["signedAtCases"]:
+            yield case["consent"]["signedAt"], self.edges, case
+        for case in self.edges["decimalsCases"]:
+            yield f"decimals {case['consent']['decimals']}", case, case
+
+    def test_render_equals_every_edges_payload(self):
+        for label, owner, case in self.accepted():
+            with self.subTest(label):
+                rendered = render(owner, case["consent"])
+                self.assertEqual(rendered, case["payload"])
+                self.assertEqual(rendered.encode(), bytes.fromhex(case["payloadHex"]))
+
+    def test_every_edges_payload_parses_back_to_the_values_it_was_rendered_from(self):
+        for label, owner, case in self.accepted():
+            with self.subTest(label):
+                self.assertEqual(parse(owner, bytes.fromhex(case["payloadHex"])), case["consent"])
+
+    def test_the_signed_at_cases_are_the_night_example_signed_in_early_years(self):
+        self.assertEqual(self.edges["ceremony"], self.golden["ceremony"])
+        cases = self.edges["signedAtCases"]
+        self.assertEqual([c["consent"]["signedAt"] for c in cases], list(EARLY_SIGNED_AT_UNIX))
+        for case in cases:
+            with self.subTest(case["consent"]["signedAt"]):
+                self.assertEqual(case["consent"],
+                                 dict(self.night["consent"], signedAt=case["consent"]["signedAt"]))
+
+    def test_early_years_carry_their_proleptic_gregorian_epoch_seconds(self):
+        self.assertEqual(
+            {c["consent"]["signedAt"]: c["signedAtUnix"] for c in self.edges["signedAtCases"]},
+            EARLY_SIGNED_AT_UNIX)
+
+    def test_year_0000_is_refused_at_3_3_4(self):
+        """The reference calendar starts at year 1, Python's MINYEAR. A proleptic-Gregorian check
+        in JavaScript accepts 0000-01-01, so a port that is not pinned here accepts a statement
+        this verifier refuses."""
+        self.assertEqual([v["name"] for v in self.edges["variants"]], ["0000-01-01T00:00:00Z"])
+        variant = self.edges["variants"][0]
+        self.assertEqual(variant["payload"], self.night["payload"].replace(
+            "signed at: 2026-09-23T18:40:26Z\n", "signed at: 0000-01-01T00:00:00Z\n"))
+        self.assertEqual(bytes.fromhex(variant["payloadHex"]), variant["payload"].encode())
+        self.assertEqual(variant["rule"], "3.3.4")
+        with self.assertRaises(vc.ConsentStatementRefused) as caught:
+            parse(self.edges, bytes.fromhex(variant["payloadHex"]))
+        self.assertEqual(caught.exception.rule, "3.3.4", str(caught.exception))
+
+    def test_decimals_cases_are_0_2_and_18_with_a_readable_and_a_hex_only_name(self):
+        cases = self.edges["decimalsCases"]
+        self.assertEqual([c["consent"]["decimals"] for c in cases], [0, 2, 18])
+        self.assertLessEqual({"readable", "hex"}, {c["tokenLineForm"] for c in cases})
+        for case in cases:
+            with self.subTest(case["consent"]["decimals"]):
+                line = token_line_of(case["payload"])
+                self.assertEqual(line, case["tokenLine"])
+                self.assertEqual(line.startswith("your token: policy "),
+                                 case["tokenLineForm"] == "hex", line)
+
+    def test_the_price_limits_are_the_band_scaled_by_ten_to_the_decimals(self):
+        """Read at decimals 6, as every case of the main golden is, the same band prints another
+        line. Binary floating point prints 2.5e-7 and 0.35000000000000003 for two of these."""
+        for case in self.edges["decimalsCases"]:
+            decimals = case["consent"]["decimals"]
+            with self.subTest(decimals):
+                self.assertEqual(case["priceLimitsLine"], PRICE_LIMITS_AT_DECIMALS[decimals])
+                self.assertEqual(case["payload"].split("\n")[6], case["priceLimitsLine"])
+                at_six = render(case, dict(case["consent"], decimals=6)).split("\n")[6]
+                self.assertNotEqual(at_six, case["priceLimitsLine"])
+
+    def test_each_decimals_ceremony_is_the_night_ceremony_with_only_its_band_replaced(self):
+        night = self.golden["ceremony"]
+        band = {"min_asset1_price", "min_asset2_price"}
+        for case in self.edges["decimalsCases"]:
+            ceremony = case["ceremony"]
+            with self.subTest(case["consent"]["decimals"]):
+                self.assertEqual(
+                    {k: v for k, v in ceremony["params"].items() if k not in band},
+                    {k: v for k, v in night["params"].items() if k not in band})
+                self.assertEqual((ceremony["network"], ceremony["unappliedScriptHash"]),
+                                 (night["network"], night["unappliedScriptHash"]))
+                encoded, _ = vc.encode_params(ceremony["params"], ceremony["network"])
+                self.assertEqual(ceremony["paramCborHex"],
+                                 [p["plutus_data_cbor_hex"] for p in encoded])
+                self.assertEqual(ceremony["challengeHex"], vc.possession_challenge(
+                    ceremony["network"], ceremony["unappliedScriptHash"], encoded).hex())
 
 
 class ConsentTermsFile(unittest.TestCase):
