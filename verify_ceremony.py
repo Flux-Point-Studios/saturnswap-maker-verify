@@ -1084,17 +1084,17 @@ def canonical_consent_payload_v2(challenge, network, params, consent):
             f"decimals, so no v2 statement exists for it: a rounded limit would be a second "
             f"spelling of the band")
     token = consent["token"]
+    policy = _hash28("policyId", token["policyId"]).hex()
     try:
         name = bytes.fromhex(token["assetNameHex"])
     except ValueError:
         raise CeremonyError(f"asset name hex {token['assetNameHex']!r} is not hexadecimal")
     if not name:
-        token_line = f"policy {token['policyId']}, empty asset name"
+        token_line = f"policy {policy}, empty asset name"
     elif _READABLE_ASSET_NAME.fullmatch(name):
-        token_line = (f"{name.decode('ascii')} (policy {token['policyId']}, "
-                      f"asset name hex {token['assetNameHex']})")
+        token_line = f"{name.decode('ascii')} (policy {policy}, asset name hex {name.hex()})"
     else:
-        token_line = f"policy {token['policyId']}, asset name hex {token['assetNameHex']}"
+        token_line = f"policy {policy}, asset name hex {name.hex()}"
     terms = consent["terms"]
     return (
         f"{CONSENT_V2_HEADER}\n"
@@ -1244,13 +1244,14 @@ def _cose_protected_bytes(cose_sign1):
     return protected, cose_sign1[start:reader.i], reader
 
 
-def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, expected_payload,
+def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, params, band,
                        payout_address=None):
-    """Returns (verification_key, address, payload) once the proof holds.
+    """Returns (verification_key, address, payload, consent) once the proof holds.
 
-    Nothing about the signed message is read from the file: the caller renders the one
-    payload this ceremony demands, and the challenge line is re-checked here so a wiring
-    bug upstream cannot widen what verifies."""
+    Nothing about the signed statement is taken on the file's word. A v2 statement is parsed
+    and must rebuild, byte for byte, from this ceremony and the values it names; `consent` is
+    those values. A v1 statement is rebuilt from the ceremony and `band` for audit only: it
+    proves the key and consents to nothing, so `consent` is None."""
     address_claim, cose_sign1, cose_key = load_cip30_proof(doc, path)
 
     protected_map_bytes, protected_bstr_bytes, reader = _cose_protected_bytes(cose_sign1)
@@ -1306,21 +1307,29 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, exp
         raise CeremonyError(
             f"{len(cose_sign1) - reader.i} trailing byte(s) after the COSE_Sign1")
 
-    if payload != expected_payload:
-        raise CeremonyError(
-            "the proof signs a different message than this ceremony's. What your wallet "
-            "signed was:\n\n"
-            + textwrap.indent(_printable(payload), "    ")
-            + "\n  and this ceremony requires:\n\n"
-            + textwrap.indent(expected_payload.decode(), "    ")
-            + "\n  A proof minted for another ceremony, or before a parameter changed, "
-              "cannot endorse this one")
-    # Asserted independently of how the caller built the payload, so a wiring bug that
-    # rendered it from the wrong network, a stale params snapshot or a None band cannot
-    # quietly widen what this function will accept.
-    if f"challenge: {challenge.hex()}\n".encode() not in payload:
-        raise CeremonyError(
-            "the signed message does not carry this ceremony's challenge line")
+    if payload.split(b"\n", 1)[0] == CONSENT_V2_HEADER.encode():
+        consent = parse_consent_payload_v2(payload, challenge, network, params)
+        if consent["decimals"] != band["decimals"]:
+            raise CeremonyError(
+                f"the statement you signed says token decimals {consent['decimals']}, but this "
+                f"run checked your band at --decimals {band['decimals']}. Its price limits are "
+                f"read at {consent['decimals']}, so they are not the band you verified here")
+    else:
+        consent = None
+        v1_payload = canonical_possession_payload(
+            challenge, network, params,
+            f"{band['bid_ceiling_ada_per_display_unit']} - "
+            f"{band['ask_floor_ada_per_display_unit']} ADA per token").encode()
+        if payload != v1_payload:
+            raise CeremonyError(
+                "the proof signs a different message than this ceremony's. What your wallet "
+                "signed was:\n\n"
+                + textwrap.indent(_printable(payload), "    ")
+                + "\n  which is neither a v2 consent statement nor this ceremony's v1 "
+                  "statement:\n\n"
+                + textwrap.indent(v1_payload.decode(), "    ")
+                + "\n  A proof minted for another ceremony, or before a parameter changed, "
+                  "cannot endorse this one")
 
     # Pinned to the exact 42 bytes cardano-message-signing emits, rather than parsed.
     # Every parser ambiguity on the key dies here at once — a duplicated -2 label whose
@@ -1385,7 +1394,7 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, exp
     if not ed25519_verify(vkey, sig_structure, signature):
         raise CeremonyError(
             f"the signature in {path} does not verify against the message it carries")
-    return vkey, my_address, payload
+    return vkey, my_address, payload, consent
 
 
 def load_possession_proof(path):
@@ -1436,7 +1445,7 @@ def load_possession_proof(path):
 
 
 def check_possession(owner_vkh, digest, proof_path, skey_path, vkey_path, cli,
-                     my_address=None, network=None, challenge=None, expected_payload=None,
+                     my_address=None, network=None, challenge=None, params=None, band=None,
                      payout_address=None):
     """Did the PRIVATE half of client_owner_vkh sign this ceremony's challenge?
 
@@ -1469,18 +1478,21 @@ def check_possession(owner_vkh, digest, proof_path, skey_path, vkey_path, cli,
                         f"{owner_vkh} signed — and whoever chose that parameter can arrange "
                         "exactly that with their own wallet. Naming your address is what "
                         "makes the proof about YOU")
-                if expected_payload is None:
+                if band is None:
                     raise CeremonyError(
                         "a CIP-30 proof can only be judged against the message this ceremony "
                         "demands, and this run did not produce one")
-                vkey, address, payload = verify_cip30_proof(
-                    doc, proof_path, owner_vkh, my_address, network, challenge,
-                    expected_payload, payout_address)
+                vkey, address, payload, consent = verify_cip30_proof(
+                    doc, proof_path, owner_vkh, my_address, network, challenge, params, band,
+                    payout_address)
                 record.update(proved=True, form="cip30-signdata",
                               signed_message="cose-sig-structure", digest=None,
                               address=address, verification_key=vkey.hex(),
                               verification_key_hash=vkh(vkey),
-                              payload=payload.decode("utf-8", "replace"))
+                              payload=payload.decode("utf-8", "replace"),
+                              statement="v2" if consent else
+                              "v1, audit only, not accepted by the keeper",
+                              consent_terms=consent)
                 return record
     # Only the CIP-30 branch above reads --my-address. Reaching here with it set means
     # the flag would be consumed and ignored, leaving a client who supplied the one
@@ -1563,6 +1575,43 @@ def load_params(path):
             "params file has unrecognised field(s): " + ", ".join(unknown) +
             "\nRefusing to run rather than silently ignore them. Expected exactly: " +
             ", ".join(p["key"] for p in PARAMS))
+    return doc
+
+
+_CONSENT_TERMS_SHAPE = {
+    "token": {"policyId": str, "assetNameHex": str},
+    "decimals": int,
+    "terms": dict.fromkeys(("spreadBps", "maxDepthAda", "dailyLossBps", "minRepriceBps"), int),
+    "signedAt": str,
+}
+
+
+def load_consent_terms(path):
+    """--consent-terms: the values a client chooses for the v2 statement, in the shape the
+    parser returns. Structure only: the statement rendered from them is judged by
+    parse_consent_payload_v2 before it is offered, like any statement this tool reads."""
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        raise CeremonyError(f"consent terms file not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise CeremonyError(f"consent terms file {path} is not valid JSON: {exc}")
+
+    def check(value, shape, where):
+        if isinstance(shape, dict):
+            if not isinstance(value, dict) or set(value) != set(shape):
+                raise CeremonyError(
+                    f"{path}: {where} must hold exactly {', '.join(shape)}, got {value!r}. "
+                    f"A key this tool does not render must not look accepted")
+            for key, inner in shape.items():
+                check(value[key], inner, f"{where}.{key}")
+        elif not isinstance(value, shape) or isinstance(value, bool):
+            raise CeremonyError(
+                f"{path}: {where} must be {'an integer' if shape is int else 'a string'}, "
+                f"got {value!r}")
+
+    check(doc, _CONSENT_TERMS_SHAPE, "the consent terms")
     return doc
 
 
@@ -2215,6 +2264,13 @@ def main(argv=None):
                              "SIGNING key, read locally by cardano-cli and never "
                              "transmitted. Simpler, but it puts the private key on this "
                              "machine, which the signature path never needs")
+    parser.add_argument("--consent-terms", metavar="FILE",
+                        help="the values you choose for the v2 consent statement, as JSON "
+                             "{token: {policyId, assetNameHex}, decimals, terms: {spreadBps, "
+                             "maxDepthAda, dailyLossBps, minRepriceBps}, signedAt}. The "
+                             "statement built from them is the possession_payload in "
+                             "--json-out, the message a wallet signs; without this flag no "
+                             "statement is offered")
     parser.add_argument("--emit-possession-challenge", metavar="FILE",
                         help="write the challenge transaction to sign here, so an "
                              "air-gapped signer needs nothing from this machine but "
@@ -2274,6 +2330,11 @@ def main(argv=None):
             "--expect-* flag. Drop it to get a verdict.")
     if args.require_live and not args.check_chain:
         parser.error("--require-live has nothing to judge without --check-chain")
+    if args.for_escape and args.consent_terms:
+        parser.error(
+            "--for-escape derives addresses to leave a ceremony, including one this tool "
+            "refuses to endorse; it never builds a statement consenting to be market-made "
+            "under it. Drop --consent-terms.")
     # Recovery is not endorsement. The coherence gate refuses a crossed band, a
     # zero floor, a foreign payout key and a bot/client collision — and the
     # validator deliberately leaves the escape branch OPEN under every one of
@@ -2333,7 +2394,7 @@ def main(argv=None):
     }
     result = {"ok": False, "verdict": "refused", "checks": checks,
               "network": args.network, "params_file": args.params,
-              "decimals": args.decimals}
+              "decimals": args.decimals, "consent_terms": None}
     workdir = tempfile.mkdtemp(prefix="mmaas-verify-")
     try:
         params = load_params(args.params)
@@ -2481,21 +2542,27 @@ def main(argv=None):
                 json.dump(challenge_tx_envelope(challenge), fh, indent=4)
                 fh.write("\n")
 
-        # The band is what a client reads back in the wallet popup, so the payload
-        # carries it in the same human units the report prints.
-        payload_band = (
-            f"{band['bid_ceiling_ada_per_display_unit']} - "
-            f"{band['ask_floor_ada_per_display_unit']} ADA per token" if band else None)
-        expected_payload = (canonical_possession_payload(
-            challenge, args.network, params, payload_band).encode() if payload_band else None)
-        result["possession_payload"] = expected_payload.decode() if expected_payload else None
+        # The one statement offered for signing is the v2 consent statement, built from terms
+        # the client names. The v1 statement says nothing about consent and is never offered.
+        result["possession_payload"] = None
+        if args.consent_terms:
+            consent = load_consent_terms(args.consent_terms)
+            if consent["decimals"] != args.decimals:
+                raise CeremonyError(
+                    f"{args.consent_terms} names token decimals {consent['decimals']}, but "
+                    f"this run checked your band at --decimals {args.decimals}. The statement "
+                    f"reads its price limits at its own decimals, so it would not show the "
+                    f"band you verified")
+            statement = canonical_consent_payload_v2(challenge, args.network, params, consent)
+            parse_consent_payload_v2(statement.encode(), challenge, args.network, params)
+            result["possession_payload"] = statement
 
         possession = check_possession(
             owner, digest, args.possession_proof, args.my_skey_file,
             args.my_vkey_file, shlex.split(args.cardano_cli),
             my_address=args.my_address, network=args.network, challenge=challenge,
-            expected_payload=expected_payload,
-            payout_address=params["client_payout_address"])
+            params=params, band=band, payout_address=params["client_payout_address"])
+        result["consent_terms"] = possession.pop("consent_terms", None)
         result["possession"] = possession
         checks["key_hash_matches_your_file"] = bool(args.my_vkey_file)
         checks["key_possession_proved"] = possession["proved"]
@@ -2505,6 +2572,14 @@ def main(argv=None):
             print(f"  Escape-hatch key {owner}\n"
                   f"  PROVED: its private half signed this ceremony's challenge "
                   f"({possession['form']}).", file=report)
+            if result["consent_terms"]:
+                print("  You consented to:", file=report)
+                for line in possession["payload"].split("\n")[7:14]:
+                    print(f"    {line}", file=report)
+            elif possession.get("statement"):
+                print(f"  The statement it signed is {possession['statement']}: it proves the\n"
+                      f"  key and consents to nothing. Sign the v2 statement (--consent-terms\n"
+                      f"  builds it) for the keeper to quote your book.", file=report)
         else:
             print(f"  NOT PROVED: that anyone can sign for {owner}.\n"
                   f"  A .vkey file is PUBLIC — hashing one says which key the ceremony\n"

@@ -2415,5 +2415,122 @@ class DeriveOnlyIsNotAVerdict(unittest.TestCase):
         self.assertFalse(js["ok"])
 
 
+
+V2_VECTORS = json.load(open(os.path.join(HERE, "testdata", "cip30-consent-v2-vectors.json")))
+
+# Terms for the golden rehearsal ceremony (0 decimals, limits 2.6 and 2.7 ADA), naming its
+# token ADAMMKT under an illustrative policy id: the statement renders any 28 bytes alike.
+GOLDEN_CONSENT = {
+    "token": {"policyId": "ad" * 28, "assetNameHex": "4144414d4d4b54"},
+    "decimals": 0,
+    "terms": {"spreadBps": 800, "maxDepthAda": 120, "dailyLossBps": 500, "minRepriceBps": 150},
+    "signedAt": "2026-09-24T09:00:00Z",
+}
+
+
+class ConsentV2Statement(unittest.TestCase):
+    """possession_payload is the v2 statement a client signs, built from the terms they name,
+    and nothing at all without them: the v1 statement is never offered for signing again."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mmaas-consent-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def terms_file(self, consent):
+        path = os.path.join(self.tmp, "consent-terms.json")
+        with open(path, "w") as fh:
+            json.dump(consent, fh)
+        return path
+
+    def test_possession_payload_is_the_v2_statement_built_from_consent_terms(self):
+        import verify_ceremony as vc
+        rc, out, err, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 0, out + err)
+        payload = js["possession_payload"]
+        self.assertTrue(payload.startswith("SaturnSwap MMaaS consent, version 2\n"), payload)
+        self.assertIn("I consent", payload)
+        self.assertEqual(payload, vc.canonical_consent_payload_v2(
+            bytes.fromhex(js["possession_challenge"]), "testnet", GOLDEN_PARAMS, GOLDEN_CONSENT))
+
+    def test_without_consent_terms_nothing_is_offered_for_signing(self):
+        rc, out, err, js = run_tool(GOLDEN_PARAMS, extra=["--derive-only"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIsNone(js["possession_payload"])
+
+    def test_terms_at_other_decimals_than_the_ones_verified_are_refused(self):
+        """The price limits in the statement are read at its own decimals, so they would not
+        be the band this run just checked."""
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(dict(GOLDEN_CONSENT, decimals=6))])
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, "decimals 6.*--decimals 0")
+        self.assertIsNone(js.get("possession_payload"))
+
+    def test_a_statement_the_keeper_would_refuse_is_never_offered(self):
+        oversize = dict(GOLDEN_CONSENT, terms=dict(GOLDEN_CONSENT["terms"], maxDepthAda=int("9" * 1100)))
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(oversize)])
+        self.assertEqual(rc, 1)
+        self.assertIn("at most 2,048", out)
+        self.assertIsNone(js.get("possession_payload"))
+
+    def test_consent_terms_are_refused_while_escaping(self):
+        """--for-escape derives a ceremony the tool may refuse to endorse; a statement
+        consenting to be market-made under it is the one thing it must not produce."""
+        rc, _, err, _ = run_tool(GOLDEN_PARAMS, extra=[
+            "--for-escape", "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 2)
+        self.assertIn("never builds a statement consenting to be market-made", err)
+
+
+class ConsentV2ProofEndToEnd(unittest.TestCase):
+    """A real wallet signature over the v2 statement, through the whole tool: rebuild, apply,
+    derive, and a verdict that says what the client consented to."""
+
+    VECTOR = next(v for v in V2_VECTORS["vectors"] if v["name"] == "mainnet-base")
+    ANCHOR = "0.09:0.11"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mmaas-consent-e2e-")
+        v = cls.VECTOR
+        cls.proof = os.path.join(cls.tmp, "possession-proof.json")
+        with open(cls.proof, "w") as fh:
+            json.dump({"type": "CIP30PossessionProof", "address": v["address"],
+                       "coseSign1": v["cose_sign1_hex"], "coseKey": v["cose_key_hex"]}, fh)
+        _, _, _, derived = run_tool(v["params"], network="mainnet", decimals=6, band=cls.ANCHOR,
+                                    vkey=None, proof=None, extra=["--derive-only"])
+        cls.order_address = derived["derived"]["order_address"]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_with_proof(self, decimals, anchor):
+        return run_tool(self.VECTOR["params"], network="mainnet", decimals=decimals, band=anchor,
+                        vkey=None, proof=None,
+                        extra=["--possession-proof", self.proof, "--my-address",
+                               self.VECTOR["address"], "--expect-order-address", self.order_address])
+
+    def test_a_real_v2_proof_earns_a_verdict_and_reports_what_was_consented_to(self):
+        rc, out, err, js = self.run_with_proof(6, self.ANCHOR)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(js["verdict"], "verified")
+        self.assertEqual(js["possession"]["statement"], "v2")
+        self.assertEqual(js["consent_terms"], self.VECTOR["consent_terms"])
+        self.assertIn("You consented to:", out)
+        for line in self.VECTOR["payload_text"].split("\n")[7:14]:
+            self.assertIn(line, out)
+
+    def test_decimals_7_against_a_statement_signed_at_6_is_refused(self):
+        """The anchor moves with the decimals, so the band check passes and the refusal is the
+        statement's own decimals line."""
+        rc, out, _, js = self.run_with_proof(7, "0.9:1.1")
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, "token decimals 6.*--decimals 7")
+        self.assertIsNone(js["consent_terms"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

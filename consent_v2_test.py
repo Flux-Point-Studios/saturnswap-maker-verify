@@ -169,6 +169,13 @@ class Render(unittest.TestCase):
                 shown = f"your token: {name.decode('ascii')} (policy " if readable else "your token: policy "
                 self.assertTrue(line.startswith(shown), line)
 
+    def test_the_rebuild_spells_hex_from_the_bytes_whatever_spelling_it_is_given(self):
+        """Spec 3.3: the round trip on its own refuses upper-case hex. A rebuild that echoed the
+        parsed spelling would reproduce it, and only the line pattern would stand in the way."""
+        base = self.cases["readable"]["consent"]
+        shouting = dict(base, token={key: value.upper() for key, value in base["token"].items()})
+        self.assertEqual(render(self.golden, shouting), self.cases["readable"]["payload"])
+
     def test_every_case_is_fifteen_ascii_lines_that_say_i_consent_with_no_dash(self):
         for form, case in self.cases.items():
             with self.subTest(form):
@@ -246,6 +253,40 @@ class Parse(unittest.TestCase):
         with self.assertRaises(vc.ConsentStatementRefused) as caught:
             vc.parse_consent_payload_v2(SPEC_2_2_NIGHT.encode(), other, network, params)
         self.assertEqual(caught.exception.rule, "3.3.5")
+
+
+class ConsentTermsFile(unittest.TestCase):
+    """--consent-terms reads the same object the parser returns and --json-out reports, with
+    nothing missing and nothing extra: a key this tool does not render must not look accepted."""
+
+    def load(self, doc):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(doc, fh)
+        self.addCleanup(os.unlink, fh.name)
+        return vc.load_consent_terms(fh.name)
+
+    def test_a_consent_object_from_the_golden_loads_as_it_is(self):
+        consent = load_golden()["cases"][0]["consent"]
+        self.assertEqual(self.load(consent), consent)
+
+    def test_a_missing_or_extra_key_is_refused_at_any_depth(self):
+        consent = load_golden()["cases"][0]["consent"]
+        for bad in (dict(consent, fee=20), {k: v for k, v in consent.items() if k != "signedAt"},
+                    dict(consent, terms=dict(consent["terms"], dailyLossKillAda=5)),
+                    dict(consent, token={"policyId": consent["token"]["policyId"]})):
+            with self.subTest(sorted(bad)):
+                with self.assertRaisesRegex(vc.CeremonyError, "exactly"):
+                    self.load(bad)
+
+    def test_a_value_of_the_wrong_type_is_refused(self):
+        consent = load_golden()["cases"][0]["consent"]
+        for bad in (dict(consent, decimals=True), dict(consent, decimals="6"),
+                    dict(consent, terms=dict(consent["terms"], spreadBps=800.0)),
+                    dict(consent, token=dict(consent["token"], assetNameHex=None))):
+            with self.subTest(bad):
+                with self.assertRaisesRegex(vc.CeremonyError, "must be"):
+                    self.load(bad)
 
 
 class FundingCap(unittest.TestCase):
