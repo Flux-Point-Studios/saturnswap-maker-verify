@@ -140,6 +140,12 @@ python3 -c 'import nacl.signing; print("PyNaCl", nacl.__version__)'
 
 # unittest, not pytest: these tools are stdlib-only because a client has to be
 # able to run them, and their suites are held to the same bar.
+gate "the v2 consent statement and the golden the keeper and the page pin to"
+python3 consent_v2_test.py
+
+gate "CIP-30 wallet proofs: real v2 consent vectors, v1 for audit"
+python3 cip30_possession_test.py
+
 gate "the ceremony verifier agrees with the built blueprint"
 python3 verify_ceremony_test.py
 

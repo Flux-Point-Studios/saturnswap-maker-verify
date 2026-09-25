@@ -60,6 +60,34 @@ What no tool can establish: that you are the *only* holder of that key. That
 follows from you having generated it yourself and produced the signature yourself.
 **If we handed you either one, the verdict is worth nothing.**
 
+### Consenting to be market-made
+
+The keeper quotes a book only under a v2 consent statement its owner signed: fifteen plain
+ASCII lines that say "I consent to SaturnSwap making a market in my token with its bot key,
+on the terms below." and name the token, the fee bound, your price limits and the four terms
+(spread, book value cap, daily loss limit, reprice step).
+
+- `--consent-terms terms.json` builds the exact statement for your ceremony. It is the
+  `possession_payload` in `--json-out`. Without the flag, no statement is offered.
+- No statement is offered for terms outside the operator bounds, because the keeper returns a
+  book signed on them to your wallet. The bounds are read from `consentTerms.bounds.json`, the
+  file the keeper and the page are tested against. Nor is one offered by a run that refuses the
+  ceremony; a run missing only your key proof still offers it, since signing it is that proof.
+- The `your wallet:` line is the address the `client_payout_address` parameter encodes, in lower
+  case, however the params file spells it.
+- Verifying a wallet proof over it prints `You consented to:` with the lines you signed, and
+  `--json-out` carries them as `consent_terms`. A proof over any other message is refused; when
+  that message is a damaged v2 statement, the refusal names the rule it breaks.
+- A proof over the older v1 statement still proves the key. It is reported as `v1, audit
+  only, not accepted by the keeper`, because it never says "I consent".
+
+```json
+{"token": {"policyId": "<56 hex>", "assetNameHex": "<hex, empty for no name>"},
+ "decimals": 6,
+ "terms": {"spreadBps": 800, "maxDepthAda": 120, "dailyLossBps": 500, "minRepriceBps": 150},
+ "signedAt": "2026-09-24T12:00:00Z"}
+```
+
 ## The published mainnet parameters
 
 Cross-check these against <https://saturnswap.io/v3/mmaas#manifest>, and against

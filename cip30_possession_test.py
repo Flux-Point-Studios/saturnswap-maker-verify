@@ -1,7 +1,8 @@
 """CIP-30 possession proofs — the form a browser wallet can actually produce.
 
-The happy-path vectors in testdata/cip30-possession-vectors.json were minted by
-@emurgo/cardano-message-signing (through lucid's signData), the library wallets
+The happy-path vectors in testdata/cip30-consent-v2-vectors.json (the v2 consent
+statement) and testdata/cip30-possession-vectors.json (v1, frozen for audit) were minted
+by @emurgo/cardano-message-signing (through lucid's signData), the library wallets
 sign with. The red cases are built HERE, by hand, so the encoder that makes a bad
 proof is never the decoder that judges it.
 
@@ -19,6 +20,10 @@ sys.path.insert(0, HERE)
 import verify_ceremony as vc  # noqa: E402
 
 VECTORS = json.load(open(os.path.join(HERE, "testdata", "cip30-possession-vectors.json")))
+# The v1 vectors sign an arbitrary challenge over a band at 0 decimals, so the ceremony they
+# answer is only this much: the challenge, the two lines a v1 statement names, and the band.
+V1_BAND = {"decimals": 0, "bid_ceiling_ada_per_display_unit": "2.6",
+           "ask_floor_ada_per_display_unit": "2.7"}
 
 
 def envelope(vector):
@@ -30,16 +35,22 @@ def envelope(vector):
     }
 
 
-def accept(vector, doc=None, payload=None, owner=None, address=None, payout="same"):
-    """Run the verifier the way the tool will, with this vector's own facts."""
+def v1_params(vector):
+    return {"client_payout_address": vector["address"], "fee_bps": VECTORS["fee_bps"]}
+
+
+def accept(vector, doc=None, band=V1_BAND, owner=None, address=None, payout="same",
+           challenge=bytes.fromhex(VECTORS["challenge_hex"])):
+    """Run the verifier the way the tool will, with this v1 vector's own facts."""
     return vc.verify_cip30_proof(
         doc if doc is not None else envelope(vector),
         "proof.json",
         owner if owner is not None else vector["client_owner_vkh"],
         address if address is not None else vector["address"],
         vector["network"],
-        bytes.fromhex(VECTORS["challenge_hex"]),
-        payload if payload is not None else vector["payload_text"].encode(),
+        challenge,
+        v1_params(vector),
+        band,
         vector["address"] if payout == "same" else payout,
     )
 
@@ -65,6 +76,17 @@ class CanonicalPayload(unittest.TestCase):
                 )
                 self.assertEqual(rendered, v["payload_text"])
 
+    def test_the_wallet_line_is_the_address_the_parameter_encodes_not_its_spelling(self):
+        """The keeper rebuilt this line from the parameter's Plutus Data, which an
+        all-upper-case bech32 shares with its lower-case spelling."""
+        for v in VECTORS["vectors"]:
+            with self.subTest(v["name"]):
+                shouting = {"client_payout_address": v["address"].upper(),
+                            "fee_bps": VECTORS["fee_bps"]}
+                self.assertEqual(vc.canonical_possession_payload(
+                    bytes.fromhex(VECTORS["challenge_hex"]), v["network"], shouting,
+                    VECTORS["band"]), v["payload_text"])
+
     def test_it_names_facts_a_human_can_refuse_in_a_wallet_popup(self):
         text = VECTORS["vectors"][0]["payload_text"]
         for fact in ("SaturnSwap", "your wallet:", "our fee:", "your band:"):
@@ -75,10 +97,11 @@ class AuthenticProofs(unittest.TestCase):
     def test_a_real_wallet_signature_verifies(self):
         for v in VECTORS["vectors"]:
             with self.subTest(v["name"]):
-                vkey, address, payload = accept(v)
+                vkey, address, payload, consent = accept(v)
                 self.assertEqual(vkey.hex(), v["public_key_hex"])
                 self.assertEqual(address, v["address"])
                 self.assertEqual(payload, v["payload_text"].encode())
+                self.assertIsNone(consent)
 
     def test_enterprise_and_base_addresses_both_work(self):
         names = {v["name"] for v in VECTORS["vectors"]}
@@ -99,7 +122,7 @@ class Refusals(unittest.TestCase):
         """The one that matters most: a genuine signature, by the right key, over a
         DIFFERENT ceremony's payload. Nothing about the message may come from the file."""
         self.refuses("different message|another ceremony",
-                     payload=b"SaturnSwap MMaaS - a different ceremony\n")
+                     band=dict(V1_BAND, ask_floor_ada_per_display_unit="2.8"))
 
     def test_a_proof_by_an_address_the_client_did_not_name_is_refused(self):
         """Without --my-address the tool proves only that SOMEBODY holding
@@ -271,7 +294,7 @@ class MalleabilityAndParserAmbiguity(unittest.TestCase):
         proof's bytes must key on the signature, not on the file."""
         doc = envelope(self.v)
         doc["coseSign1"] = self.raw.replace(b"\xa1\x66hashed\xf4", b"\xa0", 1).hex()
-        vkey, _, _ = accept(self.v, doc=doc)
+        vkey, _, _, _ = accept(self.v, doc=doc)
         self.assertEqual(vkey.hex(), self.v["public_key_hex"])
 
     def test_a_boolean_map_key_cannot_stand_in_for_the_algorithm_label(self):
@@ -308,19 +331,12 @@ class MalleabilityAndParserAmbiguity(unittest.TestCase):
             accept(self.v, payout=VECTORS["vectors"][2]["address"])
         self.assertRegex(str(caught.exception), "pays out to")
 
-    def test_the_challenge_line_is_checked_independently_of_the_payload(self):
-        """If the caller renders the payload from a stale params snapshot, the wrong
-        network or a None band, byte-equality against THAT payload proves nothing — it
-        only proves the wallet signed what the caller happened to ask for.
-
-        So the payload is left correct here and only the challenge varies: equality
-        passes, and the only thing that can still refuse is the independent assertion."""
+    def test_a_proof_over_another_challenge_is_refused(self):
+        """The statement is rebuilt inside the verifier from the challenge it is handed, so
+        every other line matching cannot carry a signature over a different ceremony."""
         with self.assertRaises(vc.CeremonyError) as caught:
-            vc.verify_cip30_proof(envelope(self.v), "p.json", self.v["client_owner_vkh"],
-                                  self.v["address"], self.v["network"],
-                                  b"\xab" * 32, self.v["payload_text"].encode(),
-                                  self.v["address"])
-        self.assertRegex(str(caught.exception), "challenge line")
+            accept(self.v, challenge=b"\xab" * 32)
+        self.assertRegex(str(caught.exception), "different message")
 
 
 class SmallOrderKeys(unittest.TestCase):
@@ -337,26 +353,28 @@ class SmallOrderKeys(unittest.TestCase):
         vkey = self.SMALL_ORDER
         owner = vc.vkh(vkey)
         address = vc.bech32_encode("addr", bytes([6 << 4 | 1]) + bytes.fromhex(owner))
-        payload = b"SaturnSwap MMaaS - small order case\nchallenge: " + b"00" * 32 + b"\n"
+        params = {"client_payout_address": address, "fee_bps": 20}
+        payload = vc.canonical_possession_payload(
+            bytes(32), "mainnet", params, "2.6 - 2.7 ADA per token").encode()
         protected = b"\xa2\x01\x27\x67address" + cbor_bstr(vc.bech32_decode(address)[1])
         cose_sign1 = (b"\x84" + cbor_bstr(protected) + b"\xa1\x66hashed\xf4"
                       + cbor_bstr(payload) + cbor_bstr(bytes(64)))
         doc = {"type": vc.CIP30_PROOF_TYPE, "address": address,
                "coseSign1": cose_sign1.hex(),
                "coseKey": (b"\xa4\x01\x01\x03\x27\x20\x06\x21" + cbor_bstr(vkey)).hex()}
-        return doc, owner, address, payload
+        return doc, owner, address, params
 
     def test_the_cip30_path_rejects_small_order_points(self):
-        doc, owner, address, payload = self._proof_naming_a_small_order_key()
+        doc, owner, address, params = self._proof_naming_a_small_order_key()
         with self.assertRaises(vc.CeremonyError) as caught:
             vc.verify_cip30_proof(doc, "proof.json", owner, address, "mainnet",
-                                  b"\x00" * 32, payload, address)
+                                  bytes(32), params, V1_BAND, address)
         self.assertRegex(str(caught.exception), "small-order")
 
     def test_the_case_really_does_reach_the_small_order_check(self):
         """If the vkh binding refused first, the case above would pass with the
         small-order guard deleted."""
-        doc, owner, address, payload = self._proof_naming_a_small_order_key()
+        doc, owner, address, _ = self._proof_naming_a_small_order_key()
         self.assertEqual(vc.vkh(self.SMALL_ORDER), owner)
         _, mine = vc.address_to_plutus_data(address, "mainnet")
         self.assertEqual(mine["payment_hash"], owner)
@@ -382,9 +400,6 @@ class DecoderHardening(unittest.TestCase):
         with self.assertRaises(vc.CeremonyError):
             vc.cbor_load(b"\xa2\x01\x01\x01\x02")
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MyAddressIsFormScoped(unittest.TestCase):
@@ -429,3 +444,173 @@ class MyAddressIsFormScoped(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+V2 = json.load(open(os.path.join(HERE, "testdata", "cip30-consent-v2-vectors.json")))
+ADC2A7F1 = "adc2a7f19bf63b378c06c7d941bba6b7f6312cb8cce5b153f356efe4"
+# The bot key D1 moves every ceremony to (spec section 11, decision 4).
+D1_BOT_KEY = "1aba8f0a279e88d7aacd20a1f8e6d6ae4293a4f18fcb17cd43f20fd8"
+
+
+def on_testnet(address):
+    _, raw = vc.bech32_decode(address)
+    return vc.bech32_encode("addr_test", bytes([raw[0] & 0xF0]) + raw[1:])
+
+
+def ceremony(vector, network=None, unapplied=None, decimals=6, **changes):
+    """(challenge, params, band) for the ceremony `vector` signed, or for that ceremony with
+    `changes`, derived the way the tool derives them."""
+    network = network or vector["network"]
+    params = dict(vector["params"], **changes)
+    encoded, payout = vc.encode_params(params, network)
+    challenge = vc.possession_challenge(network, unapplied or V2["unapplied_script_hash"], encoded)
+    return challenge, params, vc.check_ceremony_coherence(params, payout, decimals, None, HERE)
+
+
+def verify_v2(vector, network=None, doc=None, **ceremony_changes):
+    """As the tool runs it: the proof checked against the payout address the params name."""
+    challenge, params, band = ceremony(vector, network, **ceremony_changes)
+    return vc.verify_cip30_proof(doc or envelope(vector), "proof.json", vector["client_owner_vkh"],
+                                 vector["address"], network or vector["network"], challenge,
+                                 params, band, params["client_payout_address"])
+
+
+class ConsentV2Proofs(unittest.TestCase):
+    """Real wallet signatures over the v2 statement. The generator built the parameter
+    encoding, the challenge and the statement in JavaScript, the page's way; every one of
+    them is recomputed here in Python and must agree byte for byte."""
+
+    def test_python_computes_the_challenge_the_generator_did(self):
+        for v in V2["vectors"]:
+            with self.subTest(v["name"]):
+                self.assertEqual(ceremony(v)[0].hex(), v["challenge_hex"])
+
+    def test_python_renders_byte_for_byte_what_the_wallet_signed(self):
+        for v in V2["vectors"]:
+            with self.subTest(v["name"]):
+                challenge, params, _ = ceremony(v)
+                self.assertEqual(
+                    vc.canonical_consent_payload_v2(challenge, v["network"], params,
+                                                    v["consent_terms"]),
+                    v["payload_text"])
+
+    def test_the_vectors_cover_all_three_token_line_forms_on_both_networks(self):
+        lines = [v["payload_text"].split("\n")[7] for v in V2["vectors"]]
+        self.assertTrue(any(line.endswith("empty asset name") for line in lines))
+        self.assertTrue(any(line.startswith("your token: policy ") and "asset name hex" in line
+                            for line in lines))
+        self.assertTrue(any(not line.startswith("your token: policy ") for line in lines))
+        self.assertEqual({v["network"] for v in V2["vectors"]}, {"mainnet", "testnet"})
+
+    def test_a_real_v2_vector_verifies_and_yields_the_terms_it_signed(self):
+        for v in V2["vectors"]:
+            with self.subTest(v["name"]):
+                vkey, address, payload, consent = verify_v2(v)
+                self.assertEqual(vkey.hex(), v["public_key_hex"])
+                self.assertEqual(address, v["address"])
+                self.assertEqual(payload, v["payload_text"].encode())
+                self.assertIn(b"I consent", payload)
+                self.assertEqual(consent, v["consent_terms"])
+
+    def refused_by_the_rebuild(self, **ceremony_changes):
+        with self.assertRaises(vc.ConsentStatementRefused) as caught:
+            verify_v2(V2["vectors"][0], **ceremony_changes)
+        self.assertEqual(caught.exception.rule, "3.3.5", str(caught.exception))
+
+    def test_the_same_vector_is_refused_against_the_adc2a7f1_generation(self):
+        self.refused_by_the_rebuild(unapplied=ADC2A7F1)
+
+    def test_the_same_vector_is_refused_against_another_band(self):
+        self.refused_by_the_rebuild(min_asset2_price={"numerator": 1, "denominator": 8})
+
+    def test_the_same_vector_is_refused_against_another_bot_key(self):
+        self.refused_by_the_rebuild(adam_bot_pkh=D1_BOT_KEY)
+
+    def test_the_same_vector_is_refused_on_testnet(self):
+        v = V2["vectors"][0]
+        self.assertEqual(v["network"], "mainnet")
+        self.refused_by_the_rebuild(
+            network="testnet",
+            client_payout_address=on_testnet(v["params"]["client_payout_address"]),
+            fee_address=on_testnet(v["params"]["fee_address"]))
+
+    def test_the_vector_verifies_when_the_params_spell_the_payout_in_upper_case(self):
+        """Spec 3.3 rule 5: the same parameter, so the same challenge and the same one statement,
+        which the wallet signed in the lower case the keeper renders."""
+        v = next(v for v in V2["vectors"] if v["name"] == "mainnet-base")
+        shouting = v["params"]["client_payout_address"].upper()
+        self.assertEqual(verify_v2(v, client_payout_address=shouting)[3], v["consent_terms"])
+
+    def over(self, vector, payload):
+        """The vector's own COSE_Sign1 carrying another payload. The statement is judged before
+        the signature, so these refusals never depend on the signature bytes."""
+        protected, _, _ = vc._cose_protected_bytes(bytes.fromhex(vector["cose_sign1_hex"]))
+        raw = cose_sign1(protected, cbor_bstr(payload), cbor_bstr(bytes(64)))
+        return dict(envelope(vector), coseSign1=raw.hex())
+
+    def test_a_v2_statement_behind_a_stray_byte_is_refused_by_the_rule_it_breaks(self):
+        """A byte order mark before the header. Refused as any other message, the client was
+        told no reason, and the only statement on screen was v1, which is never offered."""
+        v = V2["vectors"][0]
+        with self.assertRaises(vc.ConsentStatementRefused) as caught:
+            verify_v2(v, doc=self.over(v, b"\xef\xbb\xbf" + v["payload_text"].encode()))
+        self.assertEqual(caught.exception.rule, "3.3.1")
+        self.assertIn("(rule 3.3.1)", str(caught.exception))
+
+    def test_a_message_that_is_no_v2_statement_is_refused_without_the_v1_statement(self):
+        """Spec 6.1: the v1 statement is never shown as something to sign again."""
+        v = V2["vectors"][0]
+        other = v["payload_text"].replace("consent, version 2", "consent, version 3").encode()
+        with self.assertRaises(vc.CeremonyError) as caught:
+            verify_v2(v, doc=self.over(v, other))
+        message = str(caught.exception)
+        self.assertIn("not a v2 consent statement", message)
+        self.assertIn("--consent-terms", message)
+        self.assertNotIn("escape-hatch key", message)
+        self.assertNotIn("\u2014", message)
+
+    def test_decimals_7_against_a_statement_signed_at_6_is_refused(self):
+        """The statement verifies on its own terms at 6; the refusal is that the client checked
+        the band at 7, which is not the band they signed."""
+        v = V2["vectors"][0]
+        self.assertEqual(v["consent_terms"]["decimals"], 6)
+        with self.assertRaises(vc.CeremonyError) as caught:
+            verify_v2(v, decimals=7)
+        self.assertRegex(str(caught.exception), "token decimals 6.*--decimals 7")
+
+
+class StatementVersionIsReported(unittest.TestCase):
+    """check_possession is what the tool calls, and its record is what --json-out carries."""
+
+    def possession(self, vector, envelope_doc, challenge, params, band):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(envelope_doc, fh)
+        try:
+            return vc.check_possession(
+                vector["client_owner_vkh"], bytes(32), fh.name, None, None, ["cardano-cli"],
+                my_address=vector["address"], network=vector["network"], challenge=challenge,
+                params=params, band=band, payout_address=vector["address"])
+        finally:
+            os.unlink(fh.name)
+
+    def test_a_v2_proof_reports_the_terms_it_signed(self):
+        v = V2["vectors"][0]
+        challenge, params, band = ceremony(v)
+        record = self.possession(v, envelope(v), challenge, params, band)
+        self.assertTrue(record["proved"])
+        self.assertEqual(record["statement"], "v2")
+        self.assertEqual(record["consent_terms"], v["consent_terms"])
+
+    def test_a_v1_vector_verifies_as_audit_only(self):
+        """It still proves the key; it is not consent, and the keeper refuses it (spec 3.6)."""
+        v = VECTORS["vectors"][0]
+        record = self.possession(v, envelope(v), bytes.fromhex(VECTORS["challenge_hex"]),
+                                 v1_params(v), V1_BAND)
+        self.assertTrue(record["proved"])
+        self.assertEqual(record["statement"], "v1, audit only, not accepted by the keeper")
+        self.assertIsNone(record["consent_terms"])
+
+
+if __name__ == "__main__":
+    unittest.main()
