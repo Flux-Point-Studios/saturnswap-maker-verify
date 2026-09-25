@@ -2219,6 +2219,28 @@ class ContractedFeeCeiling(unittest.TestCase):
         self.assertIn("recognised by SHAPE", out)
 
 
+class FeeAddressIsNotThePayout(unittest.TestCase):
+    """Every ADA-only payout to one address would count both as the client's payout and as the
+    operator's fee, so the fee bound could never hold and every bot action would be refused."""
+
+    def refusal(self, params):
+        from verify_ceremony import CeremonyError, check_ceremony_coherence, encode_params
+        _, payout = encode_params(params, "testnet")
+        with self.assertRaises(CeremonyError) as caught:
+            check_ceremony_coherence(params, payout, DEFAULT_DECIMALS, None, HERE)
+        return str(caught.exception)
+
+    def test_the_payout_named_as_the_fee_address_is_refused(self):
+        payout = GOLDEN_PARAMS["client_payout_address"]
+        self.assertIn("are the same address", self.refusal(dict(GOLDEN_PARAMS, fee_address=payout)))
+
+    def test_it_is_refused_however_the_params_file_spells_them(self):
+        """The validator compares the two parameters, not the strings a params file holds."""
+        payout = GOLDEN_PARAMS["client_payout_address"]
+        self.assertIn("are the same address", self.refusal(
+            dict(GOLDEN_PARAMS, fee_address=payout, client_payout_address=payout.upper())))
+
+
 class BigIntegerParameters(unittest.TestCase):
     """Anything the validator can be parameterised with has to be encodable, or
     the client holding that ceremony cannot derive their own address — and the

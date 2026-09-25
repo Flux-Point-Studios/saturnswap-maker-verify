@@ -1789,7 +1789,7 @@ def check_ceremony_coherence(doc, payout_info, decimals, anchor, project=None):
             f"position could never be repriced or cancelled by the operator and only your "
             f"escape-hatch key could move it. Refusing to endorse it")
 
-    if doc["fee_address"] == doc["client_payout_address"]:
+    if canonical_address(doc["fee_address"]) == canonical_address(doc["client_payout_address"]):
         raise CeremonyError(
             f"fee_address and client_payout_address are the same address "
             f"({doc['fee_address']}). Every ADA-only payout to it would then count BOTH "
