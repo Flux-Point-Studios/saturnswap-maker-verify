@@ -69,8 +69,15 @@ on the terms below." and name the token, the fee bound, your price limits and th
 
 - `--consent-terms terms.json` builds the exact statement for your ceremony. It is the
   `possession_payload` in `--json-out`. Without the flag, no statement is offered.
+- No statement is offered for terms outside the operator bounds, because the keeper returns a
+  book signed on them to your wallet. The bounds are read from `consentTerms.bounds.json`, the
+  file the keeper and the page are tested against. Nor is one offered by a run that refuses the
+  ceremony; a run missing only your key proof still offers it, since signing it is that proof.
+- The `your wallet:` line is the address the `client_payout_address` parameter encodes, in lower
+  case, however the params file spells it.
 - Verifying a wallet proof over it prints `You consented to:` with the lines you signed, and
-  `--json-out` carries them as `consent_terms`.
+  `--json-out` carries them as `consent_terms`. A proof over any other message is refused; when
+  that message is a damaged v2 statement, the refusal names the rule it breaks.
 - A proof over the older v1 statement still proves the key. It is reported as `v1, audit
   only, not accepted by the keeper`, because it never says "I consent".
 

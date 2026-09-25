@@ -11,6 +11,7 @@ The same generator emits consent-v2.edges.golden.json, which pins what that gold
 signed-at years 0000 to 0100, and token decimals other than 6. Its epoch seconds and price
 limits are also written out below by hand.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -24,6 +25,9 @@ import verify_ceremony as vc  # noqa: E402
 GOLDEN_PATH = os.path.join(HERE, "testdata", "consent-v2.golden.json")
 GENERATOR_PATH = os.path.join(HERE, "tools", "gen_consent_v2_golden.py")
 EDGES_PATH = os.path.join(HERE, "testdata", "consent-v2.edges.golden.json")
+# consentTerms.bounds.json is adam-oc's parity fixture for the operator bounds, copied byte for
+# byte from packages/agent-core/src/__tests__/fixtures/ at cd93666bb4e96e47ca24525dff02fd14c32c4943.
+BOUNDS_SHA256 = "a5f2ab7d629894d36ce307fdd9aef5d8481d3ffdc1831c2d646cd87f278b1f6a"
 
 # Spec 2.2, approved 2026-09-24 (section 11) with exactly one change: the daily-loss line, in
 # basis points of the book's day-open value. 500 is the section 11 default for dailyLossBps.
@@ -126,6 +130,10 @@ def token_line_of(payload_text):
     return payload_text.split("\n")[7]
 
 
+def param_cbor(params, network):
+    return [p["plutus_data_cbor_hex"] for p in vc.encode_params(params, network)[0]]
+
+
 class GoldenIsTheVerifierOutput(unittest.TestCase):
     def test_the_generator_reproduces_the_committed_golden_byte_for_byte(self):
         """A golden someone edited by hand pins the other repos to text this renderer does not
@@ -224,12 +232,60 @@ class Render(unittest.TestCase):
                 self.assertNotIn("\u2013", text)
 
     def test_percentages_are_exact_decimals_with_trailing_zeros_stripped(self):
-        """Spec 2.3: 800 -> 8, 150 -> 1.5, 20 -> 0.2, 405 -> 4.05; every integer bps terminates."""
-        text = "".join(case["payload"] for case in self.cases.values())
-        for shown in ("800 bps (8%)", "150 bps (1.5%)", "20 bps (0.2%)", "405 bps (4.05%)",
-                      "5000 bps (50%)", "6000 bps (60%)", "100 bps (1%)", "1000 bps (10%)",
-                      "500 bps (5%)", "200 bps (2%)"):
-            self.assertIn(shown, text)
+        """Spec 2.3: 800 -> 8, 150 -> 1.5, 20 -> 0.2, 405 -> 4.05; every integer bps terminates.
+        Rendered here, on every line that carries one, rather than read back out of the golden."""
+        challenge, network, params = ceremony_of(self.golden)
+        night = self.cases["readable"]["consent"]
+        lines = {
+            "fee_bps": (5, "our fee: at most {} of the ADA we pay out to your wallet, none when "
+                           "we close your order"),
+            "spreadBps": (9, "spread: {} between your book's buying and selling prices"),
+            "dailyLossBps": (11, "daily loss limit: {} of your book's value at the start of each "
+                                 "UTC day; past it we return the book to your wallet"),
+            "minRepriceBps": (12, "reprice after our price moves: {}"),
+        }
+        for bps, percent in ((800, "8"), (150, "1.5"), (20, "0.2"), (405, "4.05"), (5000, "50"),
+                             (6010, "60.1"), (1, "0.01"), (0, "0"), (10000, "100")):
+            for knob, (index, template) in lines.items():
+                with self.subTest(knob=knob, bps=bps):
+                    if knob == "fee_bps":
+                        text = vc.canonical_consent_payload_v2(
+                            challenge, network, dict(params, fee_bps=bps), night)
+                    else:
+                        text = render(self.golden, dict(night, terms=dict(night["terms"],
+                                                                          **{knob: bps})))
+                    self.assertEqual(text.split("\n")[index],
+                                     template.format(f"{bps} bps ({percent}%)"))
+
+    def test_the_wallet_line_is_the_address_the_parameter_encodes_not_its_spelling(self):
+        """Spec 3.3 rule 5. The challenge commits to the parameter's Plutus Data, which an
+        all-upper-case bech32 shares with its lower-case spelling, and the keeper renders this
+        line from that parameter in lower case. Echoing the params file would give one ceremony
+        a second statement: one the keeper never rebuilds, while the statement the page and the
+        wallet produce is refused."""
+        challenge, network, params = ceremony_of(self.golden)
+        shouting = dict(params, client_payout_address=params["client_payout_address"].upper())
+        self.assertEqual(param_cbor(shouting, network), param_cbor(params, network))
+        night = self.cases["readable"]
+        self.assertEqual(vc.canonical_consent_payload_v2(challenge, network, shouting,
+                                                         night["consent"]), night["payload"])
+        self.assertEqual(vc.parse_consent_payload_v2(night["payload"].encode(), challenge, network,
+                                                     shouting), night["consent"])
+
+    def test_a_pointer_wallet_line_carries_its_numbers_in_their_shortest_form(self):
+        """The same rule for the one address form whose bytes can differ and still encode the
+        same parameter: a pointer number padded with a redundant leading 0x80 group."""
+        challenge, network, params = ceremony_of(self.golden)
+        payment = bytes([0x41]) + bytes.fromhex(params["client_owner_vkh"])
+        shortest = vc.bech32_encode("addr", payment + bytes([0x01, 0x02, 0x03]))
+        padded = vc.bech32_encode("addr", payment + bytes([0x80, 0x01, 0x02, 0x80, 0x80, 0x03]))
+        at = {address: dict(params, client_payout_address=address) for address in (shortest, padded)}
+        self.assertEqual(param_cbor(at[padded], network), param_cbor(at[shortest], network))
+        consent = self.cases["readable"]["consent"]
+        statement = vc.canonical_consent_payload_v2(challenge, network, at[padded], consent)
+        self.assertEqual(statement.split("\n")[3], f"your wallet: {shortest}")
+        self.assertEqual(statement,
+                         vc.canonical_consent_payload_v2(challenge, network, at[shortest], consent))
 
     def test_price_limits_with_no_exact_decimal_yield_no_statement(self):
         """A rounded limit would be a second spelling of the band, and the keeper rebuilds the
@@ -278,6 +334,34 @@ class Parse(unittest.TestCase):
         shorter = raw.replace(b"book value cap: " + digits, b"book value cap: " + digits[1:], 1)
         self.assertEqual(len(shorter), 2048)
         self.assertEqual(parse(self.golden, shorter)["terms"]["maxDepthAda"], int(digits[1:]))
+
+    def refused_by(self, payload_text):
+        with self.assertRaises(vc.ConsentStatementRefused) as caught:
+            parse(self.golden, payload_text.encode())
+        return caught.exception.rule
+
+    def test_every_refusal_names_its_rule_in_the_text_a_client_reads(self):
+        """The rule is what every port is held to and what tells a client why. The tool reports
+        a refusal by its message alone."""
+        for variant in self.golden["variants"]:
+            with self.subTest(variant["name"]):
+                with self.assertRaises(vc.ConsentStatementRefused) as caught:
+                    parse(self.golden, bytes.fromhex(variant["payloadHex"]))
+                self.assertIn(f"(rule {variant['rule']})", str(caught.exception))
+
+    def test_a_changed_header_is_refused_at_3_3_3(self):
+        """The golden varies only the consent sentence, and the rebuild refuses a changed header
+        too, so without this case a deleted header check goes unseen."""
+        self.assertEqual(self.refused_by(SPEC_2_2_NIGHT.replace("version 2\n", "version 3\n", 1)),
+                         "3.3.3")
+
+    def test_upper_case_asset_name_hex_is_refused_at_3_3_4(self):
+        """The golden's upper-case variant shouts the policy id and leaves the name hex alone."""
+        self.assertEqual(self.refused_by(SPEC_2_2_NIGHT.replace(
+            "asset name hex 4e49474854", "asset name hex 4E49474854", 1)), "3.3.4")
+
+    def test_text_after_the_fifteenth_line_feed_is_refused_at_3_3_2(self):
+        self.assertEqual(self.refused_by(SPEC_2_2_NIGHT + "x"), "3.3.2")
 
     def test_a_statement_for_another_generation_is_refused_by_the_rebuild(self):
         challenge, network, params = ceremony_of(self.golden)
@@ -429,6 +513,47 @@ class ConsentTermsFile(unittest.TestCase):
             with self.subTest(bad):
                 with self.assertRaisesRegex(vc.CeremonyError, "must be"):
                     self.load(bad)
+
+
+class OperatorBounds(unittest.TestCase):
+    """--consent-terms offers no statement whose terms the keeper winds down (spec 4.3). The
+    bounds are read from the fixture the keeper and the page are tested against, so this tool
+    holds no copy of its own to drift from theirs."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(vc.CONSENT_TERMS_BOUNDS, "rb") as fh:
+            cls.raw = fh.read()
+        cls.bounds = json.loads(cls.raw)
+
+    def test_the_bounds_file_is_the_adam_oc_parity_fixture_byte_for_byte(self):
+        self.assertEqual(hashlib.sha256(self.raw).hexdigest(), BOUNDS_SHA256)
+
+    def test_the_bounds_are_spec_4_1_as_section_11_amends_it(self):
+        self.assertEqual(
+            {knob: (b["default"], b["min"], b["max"]) for knob, b in self.bounds["knobs"].items()},
+            {"spreadBps": (800, 400, 6000), "maxDepthAda": (120, 60, 120),
+             "dailyLossBps": (500, 100, 5000), "minRepriceBps": (150, 150, 1000)})
+        self.assertEqual(self.bounds["crossConstraint"]["rule"], "2 * minRepriceBps < spreadBps")
+
+    def test_each_terms_case_breaks_exactly_the_rules_the_fixture_names(self):
+        for case in self.bounds["termsCases"]:
+            with self.subTest(case["name"]):
+                consent = {"terms": case["terms"], "decimals": case["tokenDecimals"]}
+                self.assertEqual(list(vc.consent_terms_outside_bounds(consent)),
+                                 case["violations"])
+
+    def test_the_rule_the_fixture_names_without_a_case_is_judged_too(self):
+        """decimals-min has no terms case in the fixture."""
+        consent = {"terms": load_golden()["cases"][0]["consent"]["terms"], "decimals": -1}
+        self.assertEqual(vc.consent_terms_outside_bounds(consent),
+                         {"decimals-min": "tokenDecimals >= 0"})
+
+    def test_every_statement_the_goldens_pin_is_one_the_keeper_quotes(self):
+        edges = load_edges()
+        for case in load_golden()["cases"] + edges["signedAtCases"] + edges["decimalsCases"]:
+            with self.subTest(json.dumps(case["consent"])):
+                self.assertEqual(vc.consent_terms_outside_bounds(case["consent"]), {})
 
 
 class FundingCap(unittest.TestCase):

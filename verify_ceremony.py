@@ -491,6 +491,22 @@ def address_to_plutus_data(address, network):
     return data, info
 
 
+def canonical_address(address):
+    """The one bech32 spelling of an address: lower case, with a pointer's three numbers in their
+    shortest form. Every other spelling encodes the same Plutus Data parameter, so the same
+    challenge, and the keeper renders this one from that parameter."""
+    hrp, raw = bech32_decode(address)
+    if raw[0] >> 4 in (4, 5):
+        payment_hash, pointer = _decode_pointer(address, raw)
+        raw = raw[:1] + payment_hash
+        for number in pointer:
+            groups = [number & 0x7F]
+            while number := number >> 7:
+                groups.append(number & 0x7F | 0x80)
+            raw += bytes(reversed(groups))
+    return bech32_encode(hrp, raw)
+
+
 def order_address(network, dapp_hash, applied_hash):
     network_id, hrp, _ = NETWORKS[network]
     header = ORDER_ADDRESS_TYPE << 4 | network_id
@@ -1034,7 +1050,7 @@ def canonical_possession_payload(challenge, network, params, band):
     return (
         f"SaturnSwap MMaaS — proof you hold the escape-hatch key\n"
         f"network: {network}\n"
-        f"your wallet: {params['client_payout_address']}\n"
+        f"your wallet: {canonical_address(params['client_payout_address'])}\n"
         f"our fee: {params['fee_bps']} bps\n"
         f"your band: {band}\n"
         f"challenge: {challenge.hex()}\n"
@@ -1060,7 +1076,7 @@ class ConsentStatementRefused(CeremonyError):
     3.3.5), so every implementation can be held to refusing a variant for the same reason."""
 
     def __init__(self, rule, detail):
-        super().__init__(f"this is not a canonical v2 consent statement: {detail}")
+        super().__init__(f"this is not a canonical v2 consent statement (rule {rule}): {detail}")
         self.rule = rule
 
 
@@ -1075,8 +1091,7 @@ def canonical_consent_payload_v2(challenge, network, params, consent):
     dailyLossBps, minRepriceBps}, signedAt}: what --consent-terms reads, what the parser
     returns and what --json-out reports. The price limits are params 5 and 6 read at the
     SIGNED decimals, so no caller can pair a statement with a band read at other decimals.
-    This renders; parse_consent_payload_v2 judges, and nothing is offered for signing that
-    it has not accepted."""
+    This renders; parse_consent_payload_v2 judges."""
     low, high = (_exact_decimal(v) for v in _band_ada_per_token(params, consent["decimals"]))
     if low is None or high is None:
         raise CeremonyError(
@@ -1100,7 +1115,7 @@ def canonical_consent_payload_v2(challenge, network, params, consent):
         f"{CONSENT_V2_HEADER}\n"
         f"{CONSENT_V2_SENTENCE}\n"
         f"network: {network}\n"
-        f"your wallet: {params['client_payout_address']}\n"
+        f"your wallet: {canonical_address(params['client_payout_address'])}\n"
         f"our bot key: {_hash28('adam_bot_pkh', params['adam_bot_pkh']).hex()}\n"
         f"our fee: at most {_bps(params['fee_bps'])} of the ADA we pay out to your wallet, "
         f"none when we close your order\n"
@@ -1307,29 +1322,28 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, par
         raise CeremonyError(
             f"{len(cose_sign1) - reader.i} trailing byte(s) after the COSE_Sign1")
 
-    if payload.split(b"\n", 1)[0] == CONSENT_V2_HEADER.encode():
+    # The v2 header anywhere, not only on line 1: a statement behind a stray byte is refused by
+    # the rule it breaks, which tells the client why.
+    if CONSENT_V2_HEADER.encode() in payload:
         consent = parse_consent_payload_v2(payload, challenge, network, params)
         if consent["decimals"] != band["decimals"]:
             raise CeremonyError(
                 f"the statement you signed says token decimals {consent['decimals']}, but this "
                 f"run checked your band at --decimals {band['decimals']}. Its price limits are "
                 f"read at {consent['decimals']}, so they are not the band you verified here")
-    else:
-        consent = None
-        v1_payload = canonical_possession_payload(
+    elif payload == canonical_possession_payload(
             challenge, network, params,
             f"{band['bid_ceiling_ada_per_display_unit']} - "
-            f"{band['ask_floor_ada_per_display_unit']} ADA per token").encode()
-        if payload != v1_payload:
-            raise CeremonyError(
-                "the proof signs a different message than this ceremony's. What your wallet "
-                "signed was:\n\n"
-                + textwrap.indent(_printable(payload), "    ")
-                + "\n  which is neither a v2 consent statement nor this ceremony's v1 "
-                  "statement:\n\n"
-                + textwrap.indent(v1_payload.decode(), "    ")
-                + "\n  A proof minted for another ceremony, or before a parameter changed, "
-                  "cannot endorse this one")
+            f"{band['ask_floor_ada_per_display_unit']} ADA per token").encode():
+        consent = None
+    else:
+        raise CeremonyError(
+            "the proof signs a different message than this ceremony's. What your wallet signed "
+            "was:\n\n"
+            + textwrap.indent(_printable(payload), "    ")
+            + "\n  which is not a v2 consent statement. Build this ceremony's with "
+              "--consent-terms and sign exactly that: a proof minted for another ceremony, or "
+              "before a parameter changed, cannot endorse this one")
 
     # Pinned to the exact 42 bytes cardano-message-signing emits, rather than parsed.
     # Every parser ambiguity on the key dies here at once — a duplicated -2 label whose
@@ -1367,8 +1381,10 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, par
     # The ceremony's payout address must be the SAME address, not merely one paying to
     # the same key. check_ceremony_coherence constrains only the payment credential, so a
     # substituted STAKE part shares most of the bech32 string and still passes — and every
-    # payout then lands where the operator holds the delegation.
-    if payout_address is not None and my_address != payout_address:
+    # payout then lands where the operator holds the delegation. Compared as the parameter each
+    # spelling encodes, which is what the validator sees.
+    if (payout_address is not None
+            and canonical_address(my_address) != canonical_address(payout_address)):
         raise CeremonyError(
             f"you signed with {my_address}, but this ceremony pays out to {payout_address}. "
             f"Those differ, so proving you hold the one says nothing about the other")
@@ -1588,8 +1604,8 @@ _CONSENT_TERMS_SHAPE = {
 
 def load_consent_terms(path):
     """--consent-terms: the values a client chooses for the v2 statement, in the shape the
-    parser returns. Structure only: the statement rendered from them is judged by
-    parse_consent_payload_v2 before it is offered, like any statement this tool reads."""
+    parser returns. Structure only: before a statement rendered from them is offered,
+    parse_consent_payload_v2 judges it and consent_terms_outside_bounds its terms."""
     try:
         with open(path) as fh:
             doc = json.load(fh)
@@ -1615,6 +1631,33 @@ def load_consent_terms(path):
     return doc
 
 
+# adam-oc's parity fixture for the operator bounds (spec 4.1 as section 11 amends it), copied byte
+# for byte: the keeper and the page are tested against the same file, so this tool restates no bound.
+CONSENT_TERMS_BOUNDS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "consentTerms.bounds.json")
+
+
+def consent_terms_outside_bounds(consent):
+    """{rule id: rule} for each operator bound these terms break, in the fixture's ids and order;
+    empty when the keeper quotes them. Spec 4.3: the keeper never clamps such a term, it winds the
+    book down."""
+    with open(CONSENT_TERMS_BOUNDS) as fh:
+        bounds = json.load(fh)
+    terms, broken = consent["terms"], []
+    for knob in bounds["knobOrder"]:
+        if terms[knob] < bounds["knobs"][knob]["min"]:
+            broken.append(f"{knob}-min")
+        if terms[knob] > bounds["knobs"][knob]["max"]:
+            broken.append(f"{knob}-max")
+    if not 2 * terms["minRepriceBps"] < terms["spreadBps"]:
+        broken.append(bounds["crossConstraint"]["id"])
+    if consent["decimals"] < bounds["tokenDecimals"]["min"]:
+        broken.append("decimals-min")
+    if consent["decimals"] > bounds["tokenDecimals"]["max"]:
+        broken.append("decimals-max")
+    return {rule: bounds["rules"][rule] for rule in broken}
+
+
 def _exact_decimal(value):
     """A Fraction as its terminating decimal with trailing zeros stripped, or None when it
     has none. Exact at any length: the v2 statement is rebuilt byte for byte in TypeScript,
@@ -1628,7 +1671,9 @@ def _exact_decimal(value):
         return None
     places = max(twos, fives)
     scaled = value * 10 ** places
-    digits = str(abs(scaled.numerator)).rjust(places + 1, "0")
+    # Through Decimal, not str(): str() refuses an int past sys.get_int_max_str_digits(), and a
+    # floor json reads can have an exact decimal longer than that.
+    digits = format(Decimal(abs(scaled.numerator)), "f").rjust(places + 1, "0")
     whole, frac = digits[:len(digits) - places], digits[len(digits) - places:].rstrip("0")
     return ("-" if scaled < 0 else "") + whole + ("." + frac if frac else "")
 
@@ -2394,7 +2439,7 @@ def main(argv=None):
     }
     result = {"ok": False, "verdict": "refused", "checks": checks,
               "network": args.network, "params_file": args.params,
-              "decimals": args.decimals, "consent_terms": None}
+              "decimals": args.decimals, "consent_terms": None, "possession_payload": None}
     workdir = tempfile.mkdtemp(prefix="mmaas-verify-")
     try:
         params = load_params(args.params)
@@ -2544,7 +2589,9 @@ def main(argv=None):
 
         # The one statement offered for signing is the v2 consent statement, built from terms
         # the client names. The v1 statement says nothing about consent and is never offered.
-        result["possession_payload"] = None
+        # Nor is a statement the keeper refuses (spec 3.3) or winds the book down under (4.3):
+        # once signed, it cannot be taken back.
+        statement = None
         if args.consent_terms:
             consent = load_consent_terms(args.consent_terms)
             if consent["decimals"] != args.decimals:
@@ -2555,7 +2602,13 @@ def main(argv=None):
                     f"band you verified")
             statement = canonical_consent_payload_v2(challenge, args.network, params, consent)
             parse_consent_payload_v2(statement.encode(), challenge, args.network, params)
-            result["possession_payload"] = statement
+            broken = consent_terms_outside_bounds(consent)
+            if broken:
+                raise CeremonyError(
+                    f"{args.consent_terms} names terms outside the operator bounds: "
+                    f"{json.dumps(consent['terms'])} breaks {'; '.join(broken.values())}. The "
+                    f"keeper never clamps such a term; it returns a book signed on it to your "
+                    f"wallet, so no statement is offered for these terms")
 
         possession = check_possession(
             owner, digest, args.possession_proof, args.my_skey_file,
@@ -2769,6 +2822,10 @@ def main(argv=None):
             f"printed above"]
         result["key_failures"] = key_failures
         blocked = mismatches or chain_failures or key_failures
+        # Offered only beside a ceremony this run has not refused. A missing key proof alone
+        # refuses nothing about it: the statement is what the wallet signs to supply that proof.
+        if not (mismatches or chain_failures):
+            result["possession_payload"] = statement
 
         print("VERDICT", file=report)
         # An escape derivation can compare, and still never becomes a verdict: the

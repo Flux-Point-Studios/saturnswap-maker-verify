@@ -76,6 +76,17 @@ class CanonicalPayload(unittest.TestCase):
                 )
                 self.assertEqual(rendered, v["payload_text"])
 
+    def test_the_wallet_line_is_the_address_the_parameter_encodes_not_its_spelling(self):
+        """The keeper rebuilt this line from the parameter's Plutus Data, which an
+        all-upper-case bech32 shares with its lower-case spelling."""
+        for v in VECTORS["vectors"]:
+            with self.subTest(v["name"]):
+                shouting = {"client_payout_address": v["address"].upper(),
+                            "fee_bps": VECTORS["fee_bps"]}
+                self.assertEqual(vc.canonical_possession_payload(
+                    bytes.fromhex(VECTORS["challenge_hex"]), v["network"], shouting,
+                    VECTORS["band"]), v["payload_text"])
+
     def test_it_names_facts_a_human_can_refuse_in_a_wallet_popup(self):
         text = VECTORS["vectors"][0]["payload_text"]
         for fact in ("SaturnSwap", "your wallet:", "our fee:", "your band:"):
@@ -456,11 +467,12 @@ def ceremony(vector, network=None, unapplied=None, decimals=6, **changes):
     return challenge, params, vc.check_ceremony_coherence(params, payout, decimals, None, HERE)
 
 
-def verify_v2(vector, network=None, **ceremony_changes):
+def verify_v2(vector, network=None, doc=None, **ceremony_changes):
+    """As the tool runs it: the proof checked against the payout address the params name."""
     challenge, params, band = ceremony(vector, network, **ceremony_changes)
-    return vc.verify_cip30_proof(envelope(vector), "proof.json", vector["client_owner_vkh"],
+    return vc.verify_cip30_proof(doc or envelope(vector), "proof.json", vector["client_owner_vkh"],
                                  vector["address"], network or vector["network"], challenge,
-                                 params, band, vector["address"])
+                                 params, band, params["client_payout_address"])
 
 
 class ConsentV2Proofs(unittest.TestCase):
@@ -521,6 +533,41 @@ class ConsentV2Proofs(unittest.TestCase):
             network="testnet",
             client_payout_address=on_testnet(v["params"]["client_payout_address"]),
             fee_address=on_testnet(v["params"]["fee_address"]))
+
+    def test_the_vector_verifies_when_the_params_spell_the_payout_in_upper_case(self):
+        """Spec 3.3 rule 5: the same parameter, so the same challenge and the same one statement,
+        which the wallet signed in the lower case the keeper renders."""
+        v = next(v for v in V2["vectors"] if v["name"] == "mainnet-base")
+        shouting = v["params"]["client_payout_address"].upper()
+        self.assertEqual(verify_v2(v, client_payout_address=shouting)[3], v["consent_terms"])
+
+    def over(self, vector, payload):
+        """The vector's own COSE_Sign1 carrying another payload. The statement is judged before
+        the signature, so these refusals never depend on the signature bytes."""
+        protected, _, _ = vc._cose_protected_bytes(bytes.fromhex(vector["cose_sign1_hex"]))
+        raw = cose_sign1(protected, cbor_bstr(payload), cbor_bstr(bytes(64)))
+        return dict(envelope(vector), coseSign1=raw.hex())
+
+    def test_a_v2_statement_behind_a_stray_byte_is_refused_by_the_rule_it_breaks(self):
+        """A byte order mark before the header. Refused as any other message, the client was
+        told no reason, and the only statement on screen was v1, which is never offered."""
+        v = V2["vectors"][0]
+        with self.assertRaises(vc.ConsentStatementRefused) as caught:
+            verify_v2(v, doc=self.over(v, b"\xef\xbb\xbf" + v["payload_text"].encode()))
+        self.assertEqual(caught.exception.rule, "3.3.1")
+        self.assertIn("(rule 3.3.1)", str(caught.exception))
+
+    def test_a_message_that_is_no_v2_statement_is_refused_without_the_v1_statement(self):
+        """Spec 6.1: the v1 statement is never shown as something to sign again."""
+        v = V2["vectors"][0]
+        other = v["payload_text"].replace("consent, version 2", "consent, version 3").encode()
+        with self.assertRaises(vc.CeremonyError) as caught:
+            verify_v2(v, doc=self.over(v, other))
+        message = str(caught.exception)
+        self.assertIn("not a v2 consent statement", message)
+        self.assertIn("--consent-terms", message)
+        self.assertNotIn("escape-hatch key", message)
+        self.assertNotIn("\u2014", message)
 
     def test_decimals_7_against_a_statement_signed_at_6_is_refused(self):
         """The statement verifies on its own terms at 6; the refusal is that the client checked
