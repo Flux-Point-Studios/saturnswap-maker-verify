@@ -1278,11 +1278,23 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, par
             f"the proof declares COSE algorithm {protected.get(1)!r}; this tool verifies "
             f"ed25519 (EdDSA, {_COSE_ALG_EDDSA}) and nothing else")
 
-    if set(protected) != {1, "address"}:
+    # cardano-js-sdk (Lace, and every wallet on @cardano-sdk/key-management) also writes the
+    # address as kid, label 4, and as label 2 of the COSE_Key. That one addition is accepted,
+    # and only as the address itself: any other kid is a second claim about who signed.
+    if set(protected) not in ({1, "address"}, {1, 4, "address"}):
         raise CeremonyError(
             f"the COSE protected header carries labels {sorted(map(str, protected))}; this "
-            f"tool accepts exactly the algorithm and the address, so an unknown label cannot "
-            f"mean one thing here and another to a stricter verifier")
+            f"tool accepts exactly the algorithm and the address, and the address again as "
+            f"kid, so an unknown label cannot mean one thing here and another to a stricter "
+            f"verifier")
+    header_address = protected.get("address")
+    if not isinstance(header_address, bytes):
+        raise CeremonyError("the COSE protected header carries no 'address'")
+    if 4 in protected and protected[4] != header_address:
+        raise CeremonyError(
+            "the COSE protected header's kid (label 4) is not the address it names, byte for "
+            "byte. A wallet that writes a kid writes exactly those bytes, so any other kid is "
+            "refused")
 
     # The unprotected bucket is NOT covered by the signature, so it is attacker-mutable
     # in both directions: padding it produces byte-different files that verify alike
@@ -1345,23 +1357,25 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, par
               "--consent-terms and sign exactly that: a proof minted for another ceremony, or "
               "before a parameter changed, cannot endorse this one")
 
-    # Pinned to the exact 42 bytes cardano-message-signing emits, rather than parsed.
+    # Pinned to the exact bytes cardano-message-signing emits, rather than parsed: the 42,
+    # or under a kid header, cardano-js-sdk's createCoseKey with kid = the address second.
     # Every parser ambiguity on the key dies here at once — a duplicated -2 label whose
     # last value wins, a boolean label, a non-minimal 32-byte head — and each of those
     # picks a DIFFERENT key than the one that signed.
-    if len(cose_key) != len(_COSE_KEY_PREFIX) + 32 or not cose_key.startswith(_COSE_KEY_PREFIX):
-        if len(cose_key) == len(_COSE_KEY_PREFIX) + 64:
+    key_prefix = _COSE_KEY_PREFIX
+    if 4 in protected:
+        key_prefix = (b"\xa5\x01\x01\x02" + _cbor_head(2, len(header_address)) + header_address
+                      + _COSE_KEY_PREFIX[3:])
+    if len(cose_key) != len(key_prefix) + 32 or not cose_key.startswith(key_prefix):
+        if len(cose_key) == len(key_prefix) + 64:
             raise CeremonyError(
                 "the COSE_Key carries 64 key bytes — the length of an EXTENDED public key. "
                 "signData must return the 32-byte public key, not an xpub")
         raise CeremonyError(
             "the COSE_Key is not the canonical Ed25519 OKP key a CIP-30 wallet returns "
-            "(kty OKP, alg EdDSA, crv Ed25519, a 32-byte x, in that order)")
-    vkey = cose_key[len(_COSE_KEY_PREFIX):]
-
-    header_address = protected.get("address")
-    if not isinstance(header_address, bytes):
-        raise CeremonyError("the COSE protected header carries no 'address'")
+            "(kty OKP, alg EdDSA, crv Ed25519, a 32-byte x, in that order, with kid = the "
+            "address second exactly when the protected header carries one)")
+    vkey = cose_key[len(key_prefix):]
 
     # address_to_plutus_data is the decoder the rest of this file already trusts: it
     # refuses a wrong-network address, Byron/base58, and — because ADDRESS_TYPES has
