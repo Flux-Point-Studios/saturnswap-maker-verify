@@ -1283,7 +1283,7 @@ def verify_cip30_proof(doc, path, owner_vkh, my_address, network, challenge, par
     # and only as the address itself: any other kid is a second claim about who signed.
     if set(protected) not in ({1, "address"}, {1, 4, "address"}):
         raise CeremonyError(
-            f"the COSE protected header carries labels {sorted(map(str, protected))}; this "
+            f"the COSE protected header carries labels {sorted(map(repr, protected))}; this "
             f"tool accepts exactly the algorithm and the address, and the address again as "
             f"kid, so an unknown label cannot mean one thing here and another to a stricter "
             f"verifier")

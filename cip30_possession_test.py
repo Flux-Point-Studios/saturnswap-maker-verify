@@ -617,24 +617,7 @@ class StatementVersionIsReported(unittest.TestCase):
 LACE = json.load(open(os.path.join(HERE, "testdata", "cip30-lace-kid-vectors.json")))
 
 
-def _ed_encode(point):
-    x, y, z, _ = point
-    inverse = pow(z, vc._ED_P - 2, vc._ED_P)
-    x, y = x * inverse % vc._ED_P, y * inverse % vc._ED_P
-    return (y | (x & 1) << 255).to_bytes(32, "little")
-
-
-def ed25519_sign(seed, message):
-    """RFC 8032 over the verifier's own curve arithmetic, so a mutated header can carry a
-    GENUINE signature: each refusal below then stands between that header and an accept,
-    rather than behind a signature check that would refuse it anyway."""
-    digest = hashlib.sha512(seed).digest()
-    scalar = int.from_bytes(digest[:32], "little") & ((1 << 254) - 8) | (1 << 254)
-    public = _ed_encode(vc._ed_mul(scalar, vc._ED_B))
-    nonce = int.from_bytes(hashlib.sha512(digest[32:] + message).digest(), "little") % vc._ED_L
-    r = _ed_encode(vc._ed_mul(nonce, vc._ED_B))
-    k = int.from_bytes(hashlib.sha512(r + public + message).digest(), "little") % vc._ED_L
-    return r + ((nonce + k * scalar) % vc._ED_L).to_bytes(32, "little")
+from verify_ceremony_test import ed25519_sign  # noqa: E402  (the RFC 8032 test signer, one copy)
 
 
 class LaceKeyId(unittest.TestCase):
