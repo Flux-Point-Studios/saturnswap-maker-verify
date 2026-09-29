@@ -5,6 +5,7 @@ Run from the repository root:
     python tools/gen_consent_v2_statement_parity.py > testdata/consent-v2.statement-parity.json
 """
 import json
+import sys
 from fractions import Fraction
 
 import gen_consent_v2_golden as source
@@ -73,4 +74,5 @@ def emit():
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(newline="\n")
     emit()
