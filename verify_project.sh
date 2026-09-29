@@ -142,6 +142,7 @@ python3 -c 'import nacl.signing; print("PyNaCl", nacl.__version__)'
 # able to run them, and their suites are held to the same bar.
 gate "the v2 consent statement and the golden the keeper and the page pin to"
 python3 consent_v2_test.py
+python3 -m unittest tools.test_gen_consent_v2_statement_parity
 
 gate "CIP-30 wallet proofs: real v2 consent vectors, v1 for audit"
 python3 cip30_possession_test.py
