@@ -1,0 +1,516 @@
+{
+  "note": "Parity fixture for the consent terms bounds (D2 spec 4.1 as superseded by section 11, and spec 5). Authored in adam-oc; SaturnSwapWeb copies it byte for byte. The keeper and the page accept or refuse a signed value against these; they never clamp one (spec 4.3). Bounds may only widen after the first client signs (spec 0.5).",
+  "provenance": {
+    "repo": "Flux-Point-Studios/adam-oc",
+    "path": "docs/specs/D2-consent-v2.md",
+    "commit": "afe161186870939103be2c8ebb73cbfd89cacc14",
+    "sections": [
+      "4.1",
+      "5",
+      "11.2"
+    ]
+  },
+  "conventions": {
+    "units": "Knob values are integers in the unit given. Lovelace values are integers (all below 2^53).",
+    "cases": "Each terms case lists every rule it breaks in `violations`, by rule id; an empty list is accepted."
+  },
+  "knobOrder": [
+    "spreadBps",
+    "maxDepthAda",
+    "dailyLossBps",
+    "minRepriceBps"
+  ],
+  "knobs": {
+    "spreadBps": {
+      "unit": "bps, the full spread between the book's buying and selling prices",
+      "default": 800,
+      "min": 400,
+      "max": 6000
+    },
+    "maxDepthAda": {
+      "unit": "whole ADA, book value cap (both legs, the token at our price)",
+      "default": 120,
+      "min": 60,
+      "max": 120
+    },
+    "dailyLossBps": {
+      "unit": "bps of the book's value at its first complete valuation of the UTC day",
+      "default": 500,
+      "min": 100,
+      "max": 5000
+    },
+    "minRepriceBps": {
+      "unit": "bps move of our feed mid before a reprice",
+      "default": 150,
+      "min": 150,
+      "max": 1000
+    }
+  },
+  "removedKnobs": {
+    "dailyLossKillAda": "replaced by dailyLossBps (spec 11.2); a statement, pairs entry or verdict carrying it is not v2 terms"
+  },
+  "crossConstraint": {
+    "id": "reprice-within-half-spread",
+    "rule": "2 * minRepriceBps < spreadBps",
+    "strict": true
+  },
+  "tokenDecimals": {
+    "min": 0,
+    "max": 18
+  },
+  "rules": {
+    "spreadBps-min": "spreadBps >= 400",
+    "spreadBps-max": "spreadBps <= 6000",
+    "maxDepthAda-min": "maxDepthAda >= 60",
+    "maxDepthAda-max": "maxDepthAda <= 120",
+    "dailyLossBps-min": "dailyLossBps >= 100",
+    "dailyLossBps-max": "dailyLossBps <= 5000",
+    "minRepriceBps-min": "minRepriceBps >= 150",
+    "minRepriceBps-max": "minRepriceBps <= 1000",
+    "reprice-within-half-spread": "2 * minRepriceBps < spreadBps",
+    "decimals-min": "tokenDecimals >= 0",
+    "decimals-max": "tokenDecimals <= 18"
+  },
+  "termsCases": [
+    {
+      "name": "the defaults",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "spreadBps at min",
+      "terms": {
+        "spreadBps": 400,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "spreadBps just below min",
+      "terms": {
+        "spreadBps": 399,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "spreadBps-min"
+      ]
+    },
+    {
+      "name": "spreadBps at max",
+      "terms": {
+        "spreadBps": 6000,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "spreadBps just above max",
+      "terms": {
+        "spreadBps": 6001,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "spreadBps-max"
+      ]
+    },
+    {
+      "name": "maxDepthAda at min",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 60,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "maxDepthAda just below min",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 59,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "maxDepthAda-min"
+      ]
+    },
+    {
+      "name": "maxDepthAda just above max",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 121,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "maxDepthAda-max"
+      ]
+    },
+    {
+      "name": "dailyLossBps at min",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 100,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "dailyLossBps just below min",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 99,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "dailyLossBps-min"
+      ]
+    },
+    {
+      "name": "dailyLossBps at max",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 5000,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "dailyLossBps just above max",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 5001,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "dailyLossBps-max"
+      ]
+    },
+    {
+      "name": "minRepriceBps just below min",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 149
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "minRepriceBps-min"
+      ]
+    },
+    {
+      "name": "minRepriceBps at max with room in the spread",
+      "terms": {
+        "spreadBps": 2001,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 1000
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "minRepriceBps just above max with room in the spread",
+      "terms": {
+        "spreadBps": 6000,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 1001
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "minRepriceBps-max"
+      ]
+    },
+    {
+      "name": "2 * minRepriceBps == spreadBps",
+      "terms": {
+        "spreadBps": 400,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 200
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "reprice-within-half-spread"
+      ]
+    },
+    {
+      "name": "2 * minRepriceBps one below spreadBps",
+      "terms": {
+        "spreadBps": 401,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 200
+      },
+      "tokenDecimals": 6,
+      "violations": []
+    },
+    {
+      "name": "minRepriceBps at max against the default spread",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 1000
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "reprice-within-half-spread"
+      ]
+    },
+    {
+      "name": "2 * minRepriceBps == spreadBps at the max reprice",
+      "terms": {
+        "spreadBps": 2000,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 1000
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "reprice-within-half-spread"
+      ]
+    },
+    {
+      "name": "token decimals 0",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 0,
+      "violations": []
+    },
+    {
+      "name": "token decimals 18",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 18,
+      "violations": []
+    },
+    {
+      "name": "token decimals 19",
+      "terms": {
+        "spreadBps": 800,
+        "maxDepthAda": 120,
+        "dailyLossBps": 500,
+        "minRepriceBps": 150
+      },
+      "tokenDecimals": 19,
+      "violations": [
+        "decimals-max"
+      ]
+    },
+    {
+      "name": "every knob just outside",
+      "terms": {
+        "spreadBps": 6001,
+        "maxDepthAda": 59,
+        "dailyLossBps": 5001,
+        "minRepriceBps": 149
+      },
+      "tokenDecimals": 6,
+      "violations": [
+        "spreadBps-max",
+        "maxDepthAda-min",
+        "dailyLossBps-max",
+        "minRepriceBps-min"
+      ]
+    }
+  ],
+  "funding": {
+    "floorLovelace": 50000000,
+    "capFormula": "fundingCapLovelace(maxDepthAda) = floor(maxDepthAda * 1000000 * 5 / 6)",
+    "rule": "floorLovelace <= value <= fundingCapLovelace(maxDepthAda of the governing on-chain record), both inclusive",
+    "capCases": [
+      {
+        "maxDepthAda": 60,
+        "fundingCapLovelace": 50000000
+      },
+      {
+        "maxDepthAda": 61,
+        "fundingCapLovelace": 50833333
+      },
+      {
+        "maxDepthAda": 120,
+        "fundingCapLovelace": 100000000
+      }
+    ],
+    "valueCases": [
+      {
+        "maxDepthAda": 120,
+        "valueLovelace": 100000000,
+        "fundable": true
+      },
+      {
+        "maxDepthAda": 120,
+        "valueLovelace": 100000001,
+        "fundable": false
+      },
+      {
+        "maxDepthAda": 120,
+        "valueLovelace": 50000000,
+        "fundable": true
+      },
+      {
+        "maxDepthAda": 120,
+        "valueLovelace": 49999999,
+        "fundable": false
+      },
+      {
+        "maxDepthAda": 61,
+        "valueLovelace": 50833333,
+        "fundable": true
+      },
+      {
+        "maxDepthAda": 61,
+        "valueLovelace": 50833334,
+        "fundable": false
+      },
+      {
+        "maxDepthAda": 60,
+        "valueLovelace": 50000000,
+        "fundable": true
+      },
+      {
+        "maxDepthAda": 60,
+        "valueLovelace": 50000001,
+        "fundable": false
+      }
+    ]
+  },
+  "dailyLoss": {
+    "formula": "limitLovelace = floor(dayOpenValueLovelace * dailyLossBps / 10000)",
+    "anchor": "dayOpenValueLovelace is the book's first complete valuation of the UTC day; an incomplete valuation never writes the anchor and never trips the limit; a missing or unreadable anchor fails closed for that book only (spec 11.2 and its addendum).",
+    "cases": [
+      {
+        "dayOpenValueLovelace": 100000000,
+        "dailyLossBps": 500,
+        "limitLovelace": 5000000
+      },
+      {
+        "dayOpenValueLovelace": 74000001,
+        "dailyLossBps": 500,
+        "limitLovelace": 3700000
+      },
+      {
+        "dayOpenValueLovelace": 120000000,
+        "dailyLossBps": 100,
+        "limitLovelace": 1200000
+      },
+      {
+        "dayOpenValueLovelace": 120000000,
+        "dailyLossBps": 5000,
+        "limitLovelace": 60000000
+      },
+      {
+        "dayOpenValueLovelace": 1,
+        "dailyLossBps": 100,
+        "limitLovelace": 0
+      },
+      {
+        "dayOpenValueLovelace": 0,
+        "dailyLossBps": 500,
+        "limitLovelace": 0
+      }
+    ]
+  },
+  "spreadSeed": {
+    "formula": "clamp(seedBps, max(400, 2 * minRepriceBps + 1), 6000)",
+    "input": "seedBps is the page's volatility seed, an integer from 25 to 6000 (SaturnSwapWeb bandHorizon.ts spreadBpsForHorizon)",
+    "cases": [
+      {
+        "seedBps": 25,
+        "minRepriceBps": 150,
+        "spreadBps": 400
+      },
+      {
+        "seedBps": 399,
+        "minRepriceBps": 150,
+        "spreadBps": 400
+      },
+      {
+        "seedBps": 400,
+        "minRepriceBps": 150,
+        "spreadBps": 400
+      },
+      {
+        "seedBps": 800,
+        "minRepriceBps": 150,
+        "spreadBps": 800
+      },
+      {
+        "seedBps": 6000,
+        "minRepriceBps": 150,
+        "spreadBps": 6000
+      },
+      {
+        "seedBps": 6001,
+        "minRepriceBps": 150,
+        "spreadBps": 6000
+      },
+      {
+        "seedBps": 25,
+        "minRepriceBps": 200,
+        "spreadBps": 401
+      },
+      {
+        "seedBps": 500,
+        "minRepriceBps": 250,
+        "spreadBps": 501
+      },
+      {
+        "seedBps": 25,
+        "minRepriceBps": 1000,
+        "spreadBps": 2001
+      },
+      {
+        "seedBps": 3000,
+        "minRepriceBps": 1000,
+        "spreadBps": 3000
+      },
+      {
+        "seedBps": 6000,
+        "minRepriceBps": 1000,
+        "spreadBps": 6000
+      }
+    ]
+  }
+}

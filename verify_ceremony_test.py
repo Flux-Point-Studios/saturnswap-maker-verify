@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, "verify_ceremony.py")
@@ -1467,6 +1469,26 @@ class ChainConfirmation(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_a_chain_failure_offers_no_consent_statement(self):
+        """A delegation only the escape-hatch key could publish says the script on chain may not
+        be this source, so the run is refused and nothing is offered for signing beside it."""
+        tmp = tempfile.mkdtemp(prefix="mmaas-stub-")
+        try:
+            cli = self._stub(tmp, FUNDED_UTXO, DELEGATED)
+            terms = os.path.join(tmp, "consent-terms.json")
+            with open(terms, "w") as fh:
+                json.dump(GOLDEN_CONSENT, fh)
+            rc, out, err, js = run_tool(
+                GOLDEN_PARAMS,
+                extra=golden_expectations() + ["--check-chain", "--require-live",
+                                               "--cardano-cli", cli, "--consent-terms", terms])
+            self.assertEqual(rc, 1)
+            self.assertEqual(js["mismatches"], [])
+            self.assertIn("delegated to pool", " ".join(js["chain_failures"]))
+            self.assertIsNone(js["possession_payload"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_require_live_without_check_chain_is_refused(self):
         rc, out, err, js = run_tool(
             GOLDEN_PARAMS, extra=golden_expectations() + ["--require-live"])
@@ -2197,6 +2219,28 @@ class ContractedFeeCeiling(unittest.TestCase):
         self.assertIn("recognised by SHAPE", out)
 
 
+class FeeAddressIsNotThePayout(unittest.TestCase):
+    """Every ADA-only payout to one address would count both as the client's payout and as the
+    operator's fee, so the fee bound could never hold and every bot action would be refused."""
+
+    def refusal(self, params):
+        from verify_ceremony import CeremonyError, check_ceremony_coherence, encode_params
+        _, payout = encode_params(params, "testnet")
+        with self.assertRaises(CeremonyError) as caught:
+            check_ceremony_coherence(params, payout, DEFAULT_DECIMALS, None, HERE)
+        return str(caught.exception)
+
+    def test_the_payout_named_as_the_fee_address_is_refused(self):
+        payout = GOLDEN_PARAMS["client_payout_address"]
+        self.assertIn("are the same address", self.refusal(dict(GOLDEN_PARAMS, fee_address=payout)))
+
+    def test_it_is_refused_however_the_params_file_spells_them(self):
+        """The validator compares the two parameters, not the strings a params file holds."""
+        payout = GOLDEN_PARAMS["client_payout_address"]
+        self.assertIn("are the same address", self.refusal(
+            dict(GOLDEN_PARAMS, fee_address=payout, client_payout_address=payout.upper())))
+
+
 class BigIntegerParameters(unittest.TestCase):
     """Anything the validator can be parameterised with has to be encodable, or
     the client holding that ceremony cannot derive their own address — and the
@@ -2220,6 +2264,27 @@ class BigIntegerParameters(unittest.TestCase):
         params = dict(GOLDEN_PARAMS, fee_bps=self.HUGE)
         rc, out, err, js = run_tool(params, extra=["--for-escape"], vkey=None, proof=None)
         self.assertEqual(rc, 0, f"{out}\n{err}")
+        self.assertEqual(js["derived"]["applied_script_hash"], applied_hash_for(params))
+
+    #: 4,215 digits, inside what json reads, while the bid ceiling it caps has an exact decimal
+    #: of over 14,000 characters, past what str() writes for an int.
+    PAST_STR_LIMIT = {"numerator": 2 ** 14000, "denominator": 1}
+
+    def test_a_floor_whose_exact_decimal_str_cannot_write_is_shown_exactly(self):
+        from verify_ceremony import _band_ada_per_token, check_ceremony_coherence, encode_params
+        params = dict(GOLDEN_PARAMS, min_asset1_price=self.PAST_STR_LIMIT)
+        _, payout = encode_params(params, "testnet")
+        band = check_ceremony_coherence(params, payout, DEFAULT_DECIMALS, None, HERE)
+        self.assertEqual(Fraction(Decimal(band["bid_ceiling_ada_per_display_unit"])),
+                         _band_ada_per_token(params, DEFAULT_DECIMALS)[0])
+
+    def test_such_a_floor_can_still_be_escaped(self):
+        """The band is display, and the escape hatch exists for exactly the ceremonies a hostile
+        operator writes. A crash drawing it costs the client their recovery."""
+        params = dict(GOLDEN_PARAMS, min_asset1_price=self.PAST_STR_LIMIT)
+        rc, out, err, js = run_tool(params, extra=["--for-escape"], vkey=None, proof=None)
+        self.assertEqual(rc, 0, f"{out[-2000:]}\n{err[-2000:]}")
+        self.assertEqual(js["verdict"], "escape-derivation")
         self.assertEqual(js["derived"]["applied_script_hash"], applied_hash_for(params))
 
 
@@ -2413,6 +2478,224 @@ class DeriveOnlyIsNotAVerdict(unittest.TestCase):
         self.assertNotEqual(rc, 0)
         self.assertEqual(js["verdict"], "refused")
         self.assertFalse(js["ok"])
+
+
+
+V2_VECTORS = json.load(open(os.path.join(HERE, "testdata", "cip30-consent-v2-vectors.json")))
+
+# Terms for the golden rehearsal ceremony (0 decimals, limits 2.6 and 2.7 ADA), naming its
+# token ADAMMKT under an illustrative policy id: the statement renders any 28 bytes alike.
+GOLDEN_CONSENT = {
+    "token": {"policyId": "ad" * 28, "assetNameHex": "4144414d4d4b54"},
+    "decimals": 0,
+    "terms": {"spreadBps": 800, "maxDepthAda": 120, "dailyLossBps": 500, "minRepriceBps": 150},
+    "signedAt": "2026-09-24T09:00:00Z",
+}
+
+
+class ConsentV2Statement(unittest.TestCase):
+    """possession_payload is the v2 statement a client signs, built from the terms they name,
+    and nothing at all without them: the v1 statement is never offered for signing again."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mmaas-consent-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def terms_file(self, consent):
+        path = os.path.join(self.tmp, "consent-terms.json")
+        with open(path, "w") as fh:
+            json.dump(consent, fh)
+        return path
+
+    def test_possession_payload_is_the_v2_statement_built_from_consent_terms(self):
+        import verify_ceremony as vc
+        rc, out, err, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 0, out + err)
+        payload = js["possession_payload"]
+        self.assertTrue(payload.startswith("SaturnSwap MMaaS consent, version 2\n"), payload)
+        self.assertIn("I consent", payload)
+        self.assertEqual(payload, vc.canonical_consent_payload_v2(
+            bytes.fromhex(js["possession_challenge"]), "testnet", GOLDEN_PARAMS, GOLDEN_CONSENT))
+
+    def test_without_consent_terms_nothing_is_offered_for_signing(self):
+        rc, out, err, js = run_tool(GOLDEN_PARAMS, extra=["--derive-only"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIsNone(js["possession_payload"])
+
+    def test_terms_at_other_decimals_than_the_ones_verified_are_refused(self):
+        """The price limits in the statement are read at its own decimals, so they would not
+        be the band this run just checked."""
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(dict(GOLDEN_CONSENT, decimals=6))])
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, "decimals 6.*--decimals 0")
+        self.assertIsNone(js.get("possession_payload"))
+
+    def test_a_statement_over_2048_bytes_is_never_offered(self):
+        oversize = dict(GOLDEN_CONSENT, terms=dict(GOLDEN_CONSENT["terms"], maxDepthAda=int("9" * 1100)))
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(oversize)])
+        self.assertEqual(rc, 1)
+        self.assertIn("at most 2,048", out)
+        self.assertIsNone(js.get("possession_payload"))
+
+    def test_terms_outside_the_operator_bounds_are_never_offered(self):
+        """The statement parses, and the keeper would wind a book signed on it down (spec 4.3):
+        a one-way record the client must never be handed to sign."""
+        for change, rule in (({"dailyLossBps": 99}, "dailyLossBps >= 100"),
+                             ({"spreadBps": 400, "minRepriceBps": 200},
+                              "2 * minRepriceBps < spreadBps")):
+            with self.subTest(change):
+                terms = dict(GOLDEN_CONSENT, terms=dict(GOLDEN_CONSENT["terms"], **change))
+                rc, out, _, js = run_tool(GOLDEN_PARAMS, extra=[
+                    "--derive-only", "--consent-terms", self.terms_file(terms)])
+                self.assertEqual(rc, 1)
+                self.assertIn(rule, out)
+                self.assertIsNone(js["possession_payload"])
+
+    def test_a_mismatched_order_address_offers_no_statement(self):
+        """Told not to fund the address, the client must not be handed consent to it either."""
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, extra=[
+            "--consent-terms", self.terms_file(GOLDEN_CONSENT),
+            "--expect-order-address", enterprise_addr(OPERATOR_KEYPAIR_VKH)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(js["verdict"], "refused")
+        self.assertIn("DO NOT FUND THIS ADDRESS", out)
+        self.assertIsNone(js["possession_payload"])
+
+    def test_a_run_refused_after_the_statement_was_built_offers_none(self):
+        """A possession proof that does not verify is judged after the statement is built."""
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, proof=bytes(64), extra=golden_expectations() + [
+            "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 1)
+        self.assertIn("does not sign this ceremony", js["error"])
+        self.assertIsNone(js["possession_payload"])
+
+    def test_a_run_waiting_only_for_the_key_proof_still_offers_the_statement(self):
+        """Every derived value matched; what is missing is the signature the statement is for.
+        --derive-only, which checks less, offers it, so this run must too."""
+        import verify_ceremony as vc
+        rc, out, _, js = run_tool(GOLDEN_PARAMS, proof=None, extra=golden_expectations() + [
+            "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 1)
+        self.assertEqual(js["mismatches"], [])
+        self.assertIn("NO VERDICT", out)
+        self.assertEqual(js["possession_payload"], vc.canonical_consent_payload_v2(
+            bytes.fromhex(js["possession_challenge"]), "testnet", GOLDEN_PARAMS, GOLDEN_CONSENT))
+
+    def test_a_payout_spelled_in_upper_case_is_offered_the_one_statement(self):
+        """Spec 3.3 rule 5: the same parameter and the same challenge, so the same statement, in
+        the lower case the keeper renders from the parameter."""
+        import verify_ceremony as vc
+        payout = GOLDEN_PARAMS["client_payout_address"]
+        shouting = dict(GOLDEN_PARAMS, client_payout_address=payout.upper())
+        rc, out, err, js = run_tool(shouting, extra=[
+            "--derive-only", "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f"\nyour wallet: {payout}\n", js["possession_payload"])
+        self.assertEqual(js["possession_payload"], vc.canonical_consent_payload_v2(
+            bytes.fromhex(js["possession_challenge"]), "testnet", GOLDEN_PARAMS, GOLDEN_CONSENT))
+
+    def test_consent_terms_are_refused_while_escaping(self):
+        """--for-escape derives a ceremony the tool may refuse to endorse; a statement
+        consenting to be market-made under it is the one thing it must not produce."""
+        rc, _, err, _ = run_tool(GOLDEN_PARAMS, extra=[
+            "--for-escape", "--consent-terms", self.terms_file(GOLDEN_CONSENT)])
+        self.assertEqual(rc, 2)
+        self.assertIn("never builds a statement consenting to be market-made", err)
+
+
+class ConsentV2ProofEndToEnd(unittest.TestCase):
+    """A real wallet signature over the v2 statement, through the whole tool: rebuild, apply,
+    derive, and a verdict that says what the client consented to."""
+
+    VECTOR = next(v for v in V2_VECTORS["vectors"] if v["name"] == "mainnet-base")
+    ANCHOR = "0.09:0.11"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="mmaas-consent-e2e-")
+        v = cls.VECTOR
+        cls.proof = os.path.join(cls.tmp, "possession-proof.json")
+        with open(cls.proof, "w") as fh:
+            json.dump({"type": "CIP30PossessionProof", "address": v["address"],
+                       "coseSign1": v["cose_sign1_hex"], "coseKey": v["cose_key_hex"]}, fh)
+        _, _, _, derived = run_tool(v["params"], network="mainnet", decimals=6, band=cls.ANCHOR,
+                                    vkey=None, proof=None, extra=["--derive-only"])
+        cls.order_address = derived["derived"]["order_address"]
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_with_proof(self, decimals, anchor, params=None):
+        return run_tool(params or self.VECTOR["params"], network="mainnet", decimals=decimals,
+                        band=anchor, vkey=None, proof=None,
+                        extra=["--possession-proof", self.proof, "--my-address",
+                               self.VECTOR["address"], "--expect-order-address", self.order_address])
+
+    def test_a_real_v2_proof_earns_a_verdict_and_reports_what_was_consented_to(self):
+        rc, out, err, js = self.run_with_proof(6, self.ANCHOR)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(js["verdict"], "verified")
+        self.assertEqual(js["possession"]["statement"], "v2")
+        self.assertEqual(js["consent_terms"], self.VECTOR["consent_terms"])
+        self.assertIn("You consented to:", out)
+        for line in self.VECTOR["payload_text"].split("\n")[7:14]:
+            self.assertIn(line, out)
+
+    def test_a_params_file_spelling_the_payout_in_upper_case_verifies_the_same_proof(self):
+        shouting = dict(self.VECTOR["params"], client_payout_address=self.VECTOR["address"].upper())
+        rc, out, err, js = self.run_with_proof(6, self.ANCHOR, shouting)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(js["verdict"], "verified")
+        self.assertEqual(js["consent_terms"], self.VECTOR["consent_terms"])
+
+    def test_decimals_7_against_a_statement_signed_at_6_is_refused(self):
+        """The anchor moves with the decimals, so the band check passes and the refusal is the
+        statement's own decimals line."""
+        rc, out, _, js = self.run_with_proof(7, "0.9:1.1")
+        self.assertEqual(rc, 1)
+        self.assertRegex(out, "token decimals 6.*--decimals 7")
+        self.assertIsNone(js["consent_terms"])
+
+
+NIGHT_V1_RECORD = json.load(open(os.path.join(HERE, "testdata", "mainnet-night-v1-consent.json")))
+NIGHT_PARAMS = json.load(open(os.path.join(HERE, "testdata", "consent-v2.golden.json")))["ceremony"]["params"]
+# The credential the live NIGHT order sits under (D2 spec section 7, read from Kupo).
+NIGHT_LIVE_CREDENTIAL = "ae354eef546c4b1052534470e0d0d989d343b7d963bc85243b335f0b"
+
+
+class ConsentV1ProofEndToEnd(unittest.TestCase):
+    """The live NIGHT book's own on-chain consent, which its client's wallet signed over the v1
+    statement. It still proves the escape-hatch key, and the tool says it consents to nothing."""
+
+    def test_the_live_night_v1_record_proves_the_key_and_is_reported_audit_only(self):
+        record = NIGHT_V1_RECORD["metadata"]
+        address, cose_sign1, cose_key = ("".join(record[key]) for key in ("addr", "sig", "key"))
+        self.assertEqual(record["n"], [len(address), len(cose_sign1), len(cose_key)])
+        self.assertEqual(address, NIGHT_PARAMS["client_payout_address"])
+        tmp = tempfile.mkdtemp(prefix="mmaas-consent-v1-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        proof = os.path.join(tmp, "possession-proof.json")
+        with open(proof, "w") as fh:
+            json.dump({"type": "CIP30PossessionProof", "address": address,
+                       "coseSign1": cose_sign1, "coseKey": cose_key}, fh)
+        ceremony = dict(network="mainnet", decimals=6, band="0.09:0.11", vkey=None, proof=None)
+        _, _, _, derived = run_tool(NIGHT_PARAMS, extra=["--derive-only"], **ceremony)
+        self.assertEqual(derived["derived"]["applied_script_hash"], NIGHT_LIVE_CREDENTIAL)
+
+        rc, out, err, js = run_tool(NIGHT_PARAMS, **ceremony, extra=[
+            "--possession-proof", proof, "--my-address", address,
+            "--expect-order-address", derived["derived"]["order_address"]])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(js["verdict"], "verified")
+        self.assertEqual(js["possession"]["statement"], "v1, audit only, not accepted by the keeper")
+        self.assertIsNone(js["consent_terms"])
+        self.assertIn("v1, audit only, not accepted by the keeper", out)
+        self.assertIn("consents to nothing", out)
+        self.assertNotIn("You consented to:", out)
 
 
 if __name__ == "__main__":
