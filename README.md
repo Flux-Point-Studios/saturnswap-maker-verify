@@ -1,4 +1,4 @@
-# SaturnSwap MMaaS — verify your own ceremony
+# SaturnSwap MMaaS: verify your own ceremony
 
 This repository publishes source generations for your market-making instance, plus the tool that
 checks it. It exists so you never have to take SaturnSwap's word for anything.
@@ -6,7 +6,7 @@ checks it. It exists so you never have to take SaturnSwap's word for anything.
 **Check your generation first.** The repository root publishes the current source generation;
 every generation it has ever published is retained under `generations/`. Which one YOUR address
 was built on is decided by your credential, not by which is newest, so read
-[Validator generations](GENERATIONS.md) — it lists every published generation with the source
+[Validator generations](GENERATIONS.md). It lists every published generation with the source
 selector, exact pins, security differences, and migration requirements.
 
 
@@ -46,7 +46,7 @@ Three ways to prove it, and you need exactly one:
 
 | you have | pass |
 |---|---|
-| a browser wallet | `--possession-proof possession-proof.json --my-address <your address>` — the onboarding page produces that file from a wallet signature |
+| a browser wallet | `--possession-proof possession-proof.json --my-address <your address>`; the onboarding page produces that file from a wallet signature |
 | a signing key file | `--my-skey-file payment.skey` |
 | a hardware or offline signer | `--possession-proof <witness or detached signature>` (see `--derive-only` for the challenge) |
 
@@ -95,7 +95,7 @@ any source that is not us.
 
 | parameter | value |
 |---|---|
-| `adam_bot_pkh` | `cea98dfce26e0ffbf5ab892edcb8f8ab8b794d5390f80ec0b9aafed3` |
+| `adam_bot_pkh` | `1aba8f0a279e88d7aacd20a1f8e6d6ae4293a4f18fcb17cd43f20fd8` |
 | `dapp_hash` | `11928a3ac3b65edbf103ea6bb3362e39b879a36f02897df31c40917b` |
 | `beacon_id` | `8a199a17ef4517215945aaf3c8c5204c60fd94d34c46d341e99c8fcf` |
 | `fee_address` | `addr1v9wr69p2tx8dx2lat8rzznahxh4xhfl075yzm8uxmth4tvcf3lx47` |
@@ -107,15 +107,18 @@ Each is checkable on chain rather than by trust:
   that script from any mainnet indexer and read the error strings inside it: they
   say `Two-way swaps must have exactly three kinds of beacons`, `Wrong
   asset1_beacon` and `Wrong asset2_beacon`. A **one-way** policy says `One-way`
-  and `Wrong offer_beacon` instead — that is how the two deployments are told
+  and `Wrong offer_beacon` instead. That is how the two deployments are told
   apart, and they are otherwise indistinguishable. This validator is two-way: its
   datum has twelve fields with an `asset1_price` and an `asset2_price`, where the
   one-way datum has eleven and a single `swap_price`.
 - `dapp_hash` appears inside that same beacon script as an applied parameter, so
   one fetch checks both rows.
 - `adam_bot_pkh` is the payment credential of
-  `addr1v882nr0uufhql7l44wyjah9clz4ck72d2wg0srkqhx40a5c6g5gjp`, the address that
-  key funds and has signed from many times on mainnet.
+  `addr1vydt4rc2y70g34a2e5s2r78x66hy9yay7x8uk97dg0eqlkqefwst2`, the address the
+  bot key pays reprice fees from. Anyone can check its spends on any mainnet
+  explorer. It replaces the retired key
+  `cea98dfce26e0ffbf5ab892edcb8f8ab8b794d5390f80ec0b9aafed3` and its address
+  `addr1v882nr0uufhql7l44wyjah9clz4ck72d2wg0srkqhx40a5c6g5gjp`.
 - `fee_address` is an enterprise address (header `0x61`) used for this fee and
   nothing else.
 
@@ -123,7 +126,7 @@ Each is checkable on chain rather than by trust:
 
 `maker_stake_bound` is the perimeter. A keeper-signed action may only return
 value to your order address, pay your payout address, or take one ADA-only fee
-leg at the published fee address — bounded by `fee_bps`, which the validator
+leg at the published fee address, bounded by `fee_bps`, which the validator
 refuses to build above `max_fee_bps = 500`. Anything else fails the per-asset
 conservation check.
 
