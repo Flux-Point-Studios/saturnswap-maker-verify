@@ -10,6 +10,7 @@ Every refusal gets a case that fails for THAT reason. A suite that only replays
 one captured vector proves the decoder parses Eternl, not that any check fires.
 """
 import copy
+import hashlib
 import json
 import os
 import sys
@@ -610,6 +611,140 @@ class StatementVersionIsReported(unittest.TestCase):
         self.assertTrue(record["proved"])
         self.assertEqual(record["statement"], "v1, audit only, not accepted by the keeper")
         self.assertIsNone(record["consent_terms"])
+
+
+
+LACE = json.load(open(os.path.join(HERE, "testdata", "cip30-lace-kid-vectors.json")))
+
+
+from verify_ceremony_test import ed25519_sign  # noqa: E402  (the RFC 8032 test signer, one copy)
+
+
+class LaceKeyId(unittest.TestCase):
+    """cardano-js-sdk, and so Lace, signs with the address bytes as `kid` too: label 4 of the
+    protected header and label 2 of the COSE_Key. Exactly that addition is accepted, with kid
+    equal to the address the header names; every other extra label, position or type is not.
+    The two shapes are one key signing one statement, captured with the keeper's verdict."""
+
+    def setUp(self):
+        c = LACE["ceremony"]
+        self.params, self.network = c["params"], c["network"]
+        self.payout = self.params["client_payout_address"]
+        self.address = vc.bech32_decode(self.payout)[1]
+        encoded, payout_info = vc.encode_params(self.params, self.network)
+        self.challenge = vc.possession_challenge(self.network, c["unappliedScriptHash"], encoded)
+        self.band = vc.check_ceremony_coherence(self.params, payout_info, LACE["consentTerms"]["decimals"],
+                                                None, HERE)
+        self.lace = LACE["probe"]["lace-shape"]["proof"]
+        self.lucid = LACE["probe"]["lucid-shape"]["proof"]
+        self.payload = LACE["probe"]["payload"].encode()
+        self.seed = hashlib.sha256(LACE["provenance"]["fixtureClientKey"]["paymentSeed"].encode()).digest()
+        self.vkey = bytes.fromhex(self.lace["coseKey"])[-32:]
+        # The same payment key under another stake key: the same length, and the same key signs
+        # for it, so only the bytes themselves tell it from the address the header names.
+        self.restaked = self.address[:29] + hashlib.sha256(b"another stake key").digest()[:28]
+
+    def verify(self, doc):
+        return vc.verify_cip30_proof(doc, "proof.json", LACE["probe"]["ownerVkh"], self.payout,
+                                     self.network, self.challenge, self.params, self.band, self.payout)
+
+    def refuses(self, doc, matching):
+        with self.assertRaises(vc.CeremonyError) as caught:
+            self.verify(doc)
+        self.assertRegex(str(caught.exception), matching)
+
+    def signed(self, protected, unprotected=b"\xa0", cose_key=None):
+        sig_structure = (b"\x84" + vc._cbor_head(3, 10) + b"Signature1" + cbor_bstr(protected)
+                         + b"\x40" + cbor_bstr(self.payload))
+        raw = cose_sign1(protected, cbor_bstr(self.payload),
+                         cbor_bstr(ed25519_sign(self.seed, sig_structure)), unprotected)
+        return dict(self.lace, coseSign1=raw.hex(),
+                    coseKey=(cose_key if cose_key is not None else bytes.fromhex(self.lace["coseKey"])).hex())
+
+    def kid_key(self, kid_item):
+        return b"\xa5\x01\x01\x02" + kid_item + b"\x03\x27\x20\x06\x21" + cbor_bstr(self.vkey)
+
+    def test_the_fixture_is_the_ceremony_the_keeper_judged(self):
+        self.assertEqual(self.challenge.hex(), LACE["probe"]["challengeHex"])
+        self.assertEqual(self.challenge.hex(), LACE["ceremony"]["challengeHex"])
+        self.assertEqual(LACE["probe"]["lucid-shape"]["keeper"], "ok")
+        self.assertEqual(LACE["probe"]["lace-shape"]["keeper"], "ok")
+
+    def test_the_lace_proof_is_cardano_js_sdk_layout_byte_for_byte(self):
+        protected, _, _ = vc._cose_protected_bytes(bytes.fromhex(self.lace["coseSign1"]))
+        self.assertEqual(protected, b"\xa3\x01\x27\x04" + cbor_bstr(self.address)
+                         + b"\x67address" + cbor_bstr(self.address))
+        self.assertEqual(bytes.fromhex(self.lace["coseKey"]), self.kid_key(cbor_bstr(self.address)))
+
+    def test_the_test_signer_reproduces_the_wallet_signature(self):
+        """Positive control for every re-signed case below: the same bytes signed here are the
+        signature the wallet library produced."""
+        doc = self.signed(vc._cose_protected_bytes(bytes.fromhex(self.lace["coseSign1"]))[0],
+                          unprotected=b"\xa1\x66hashed\xf4")
+        self.assertEqual(doc["coseSign1"], self.lace["coseSign1"])
+
+    def test_a_lace_proof_verifies_with_the_consent_a_lucid_proof_does(self):
+        lucid = self.verify(self.lucid)
+        lace = self.verify(self.lace)
+        self.assertEqual(lace[3], LACE["consentTerms"])
+        self.assertEqual(lace, lucid)
+
+    def test_a_kid_that_is_an_integer_is_refused(self):
+        protected = b"\xa3\x01\x27\x04\x01\x67address" + cbor_bstr(self.address)
+        self.refuses(self.signed(protected), r"kid \(label 4\) is not the address")
+
+    def test_a_kid_that_is_the_address_as_text_is_refused(self):
+        text = vc._cbor_head(3, len(self.payout)) + self.payout.encode()
+        protected = b"\xa3\x01\x27\x04" + text + b"\x67address" + cbor_bstr(self.address)
+        self.refuses(self.signed(protected), r"kid \(label 4\) is not the address")
+
+    def test_a_kid_naming_another_address_is_refused(self):
+        protected = (b"\xa3\x01\x27\x04" + cbor_bstr(self.restaked) + b"\x67address"
+                     + cbor_bstr(self.address))
+        self.refuses(self.signed(protected, cose_key=self.kid_key(cbor_bstr(self.restaked))),
+                     r"kid \(label 4\) is not the address")
+
+    def test_a_kid_in_the_unsigned_header_is_refused(self):
+        protected = b"\xa2\x01\x27\x67address" + cbor_bstr(self.address)
+        doc = self.signed(protected, unprotected=b"\xa1\x04" + cbor_bstr(self.address),
+                          cose_key=bytes.fromhex(self.lucid["coseKey"]))
+        self.refuses(doc, "unprotected header is not one this tool accepts")
+
+    def test_another_extra_protected_label_is_refused(self):
+        for name, extra in (("5", b"\x05" + cbor_bstr(self.address)),
+                            ("foo", b"\x63foo" + cbor_bstr(self.address))):
+            with self.subTest(name):
+                protected = (b"\xa4\x01\x27\x04" + cbor_bstr(self.address) + extra
+                             + b"\x67address" + cbor_bstr(self.address))
+                self.refuses(self.signed(protected), "protected header carries labels")
+
+    def test_a_kid_key_under_a_header_without_kid_is_refused(self):
+        self.refuses(dict(self.lucid, coseKey=self.lace["coseKey"]), "canonical Ed25519 OKP key")
+
+    def test_a_kid_header_with_a_key_without_kid_is_refused(self):
+        self.refuses(dict(self.lace, coseKey=self.lucid["coseKey"]), "canonical Ed25519 OKP key")
+
+    def test_a_key_kid_naming_another_address_is_refused(self):
+        key = self.kid_key(cbor_bstr(self.restaked))
+        self.refuses(dict(self.lace, coseKey=key.hex()), "canonical Ed25519 OKP key")
+
+    def test_a_key_kid_out_of_position_is_refused(self):
+        key = (b"\xa5\x01\x01\x03\x27\x02" + cbor_bstr(self.address) + b"\x20\x06\x21"
+               + cbor_bstr(self.vkey))
+        self.refuses(dict(self.lace, coseKey=key.hex()), "canonical Ed25519 OKP key")
+
+    def test_a_key_naming_its_kid_twice_is_refused(self):
+        kid = b"\x02" + cbor_bstr(self.address)
+        key = b"\xa6\x01\x01" + kid + kid + b"\x03\x27\x20\x06\x21" + cbor_bstr(self.vkey)
+        self.refuses(dict(self.lace, coseKey=key.hex()), "canonical Ed25519 OKP key")
+
+    def test_a_key_kid_with_a_wide_head_is_refused(self):
+        wide = b"\x59" + len(self.address).to_bytes(2, "big") + self.address
+        self.refuses(dict(self.lace, coseKey=self.kid_key(wide).hex()), "canonical Ed25519 OKP key")
+
+    def test_an_extended_public_key_with_kid_is_refused_and_named(self):
+        key = self.kid_key(cbor_bstr(self.address))[:-34] + cbor_bstr(self.vkey + bytes(32))
+        self.refuses(dict(self.lace, coseKey=key.hex()), "EXTENDED")
 
 
 if __name__ == "__main__":
