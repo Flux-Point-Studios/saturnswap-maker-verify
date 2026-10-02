@@ -10,6 +10,7 @@ signature and the check it names is the only thing between it and an accept.
 """
 import ast
 import hashlib
+import hmac
 import inspect
 import json
 import os
@@ -84,6 +85,16 @@ def envelope(cose_sign1_hex, cose_key_hex, payload=None, address=None):
     return vc.verify_cip30_envelope(cose_sign1_hex, cose_key_hex,
                                     Fixture.payload if payload is None else payload,
                                     Fixture.address if address is None else address)
+
+
+def verify_lace_ceremony(doc):
+    """verify_cip30_proof as the tool runs it, against the lace-kid fixture's ceremony."""
+    c = LACE["ceremony"]
+    encoded, payout_info = vc.encode_params(c["params"], c["network"])
+    challenge = vc.possession_challenge(c["network"], c["unappliedScriptHash"], encoded)
+    band = vc.check_ceremony_coherence(c["params"], payout_info, LACE["consentTerms"]["decimals"], None, HERE)
+    return vc.verify_cip30_proof(doc, "proof.json", c["params"]["client_owner_vkh"], Fixture.payout,
+                                 c["network"], challenge, c["params"], band, Fixture.payout)
 
 
 class TheContract(unittest.TestCase):
@@ -316,17 +327,9 @@ class NothingButACodedRefusal(unittest.TestCase):
 class OneBody(unittest.TestCase):
     """verify_cip30_proof is a caller of the envelope: one reader of the COSE, not two."""
 
-    def verify_lace(self, doc):
-        c = LACE["ceremony"]
-        encoded, payout_info = vc.encode_params(c["params"], c["network"])
-        challenge = vc.possession_challenge(c["network"], c["unappliedScriptHash"], encoded)
-        band = vc.check_ceremony_coherence(c["params"], payout_info, LACE["consentTerms"]["decimals"], None, HERE)
-        return vc.verify_cip30_proof(doc, "proof.json", c["params"]["client_owner_vkh"], Fixture.payout,
-                                     c["network"], challenge, c["params"], band, Fixture.payout)
-
     def test_verify_cip30_proof_hands_the_envelope_the_statement_and_the_address(self):
         with mock.patch.object(vc, "verify_cip30_envelope", wraps=vc.verify_cip30_envelope) as spy:
-            self.verify_lace(Fixture.lace)
+            verify_lace_ceremony(Fixture.lace)
         spy.assert_called_once()
         args, kwargs = spy.call_args
         self.assertEqual(args, (Fixture.lace["coseSign1"], Fixture.lace["coseKey"], Fixture.payload,
@@ -337,12 +340,12 @@ class OneBody(unittest.TestCase):
         refusal = vc.CoseRejected("bad_signature", "sentinel")
         with mock.patch.object(vc, "verify_cip30_envelope", side_effect=refusal):
             with self.assertRaises(vc.CoseRejected) as caught:
-                self.verify_lace(Fixture.lace)
+                verify_lace_ceremony(Fixture.lace)
         self.assertIs(caught.exception, refusal)
 
     def test_the_signature_is_verified_once(self):
         with mock.patch.object(vc, "ed25519_verify", wraps=vc.ed25519_verify) as spy:
-            self.verify_lace(Fixture.lucid)
+            verify_lace_ceremony(Fixture.lucid)
         self.assertEqual(spy.call_count, 1)
 
     def test_the_proof_reader_names_no_cose_primitive_itself(self):
@@ -358,9 +361,139 @@ class OneBody(unittest.TestCase):
         raw = bytearray(bytes.fromhex(Fixture.lucid["coseSign1"]))
         raw[-1] ^= 0x01
         with self.assertRaises(vc.CeremonyError) as caught:
-            self.verify_lace(dict(Fixture.lucid, coseSign1=raw.hex()))
+            verify_lace_ceremony(dict(Fixture.lucid, coseSign1=raw.hex()))
         self.assertEqual(str(caught.exception),
                          "the signature in proof.json does not verify against the message it carries")
+
+
+ALERT = os.path.join(HERE, "testdata", "cip30-alert-vectors.json")
+ALERT_NAMES = {"bind-preprod-telegram", "bind-mainnet-discord", "unbind-preprod-telegram",
+               "lace-kid-bind-mainnet-telegram", "relayed-purpose-unbind-as-bind",
+               "relayed-purpose-bind-as-unbind", "wrong-address-restaked", "small-order", "trailing-bytes"}
+
+
+def c3_payload(f):
+    """Contract C3 v1, rendered here independently of the generator that signed it."""
+    book = f["credential"][:8]
+    if f["purpose"] == "bind-alerts":
+        target = {"telegram": "Telegram chat", "discord": "Discord channel"}[f["platform"]]
+        sentence = f"Send alerts for book {book} to the {target} you confirmed with code {f['code']}."
+    else:
+        sentence = f"Stop alerts for book {book} to destination {f['destination_digest'][:8]}."
+    lines = ["SaturnSwap MMaaS alerts v1", sentence, f"purpose={f['purpose']}", f"network={f['network']}",
+             f"credential={f['credential']}", f"payout={f['payout']}",
+             f"destination={f['platform']}:{f['destination_digest']}"]
+    if f["purpose"] == "bind-alerts":
+        lines.append(f"code={f['code']}")
+    return "\n".join(lines + [f"nonce={f['nonce']}", f"expires={f['expires']}"])
+
+
+class AlertVectors(unittest.TestCase):
+    """testdata/cip30-alert-vectors.json, the vectors the alert service binds against: wallet-library
+    signatures over C3 payloads, each with the verdict C4 demands."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(ALERT) as fh:
+            cls.doc = json.load(fh)
+        cls.vectors = {v["name"]: v for v in cls.doc["vectors"]}
+
+    def test_the_named_alert_cases_are_all_published(self):
+        self.assertEqual(set(self.vectors), ALERT_NAMES)
+
+    def test_every_vector_gets_the_verdict_it_publishes(self):
+        for v in self.doc["vectors"]:
+            with self.subTest(v["name"]):
+                args = (v["cose_sign1_hex"], v["cose_key_hex"], v["expected_payload_text"].encode(),
+                        bytes.fromhex(v["expected_address_hex"]))
+                if v["expect"]["accepted"]:
+                    self.assertEqual(vc.verify_cip30_envelope(*args).hex(), v["expect"]["vkey_hex"])
+                else:
+                    with self.assertRaises(vc.CoseRejected) as caught:
+                        vc.verify_cip30_envelope(*args)
+                    self.assertEqual(caught.exception.code, v["expect"]["code"], str(caught.exception))
+
+    def test_the_payload_is_c3_byte_for_byte(self):
+        for v in self.doc["vectors"]:
+            with self.subTest(v["name"]):
+                text = v["expected_payload_text"]
+                self.assertEqual(text, c3_payload(v["c3"]))
+                self.assertTrue(text.isascii())
+                self.assertFalse(text.endswith("\n"))
+                self.assertNotIn("\r", text)
+                self.assertEqual(v["network"], v["c3"]["network"])
+
+    def test_the_c3_fields_are_the_shapes_c3_pins(self):
+        for v in self.doc["vectors"]:
+            with self.subTest(v["name"]):
+                f = v["c3"]
+                self.assertRegex(f["credential"], r"^[0-9a-f]{56}$")
+                self.assertRegex(f["destination_digest"], r"^[0-9a-f]{64}$")
+                self.assertRegex(f["nonce"], r"^[0-9a-f]{48}$")
+                self.assertRegex(f["expires"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                if f["purpose"] == "bind-alerts":
+                    self.assertRegex(f["code"], r"^[A-Z2-7]{8}$")
+                else:
+                    self.assertNotIn("code", f)
+
+    def test_the_destination_digest_is_the_hmac_c3_names(self):
+        key = bytes.fromhex(self.doc["destination_hmac_key_hex"])
+        for v in self.doc["vectors"]:
+            with self.subTest(v["name"]):
+                f = v["c3"]
+                message = f"{f['platform']}:{f['destination_id']}".encode()
+                self.assertEqual(f["destination_digest"], hmac.new(key, message, hashlib.sha256).hexdigest())
+
+    def test_the_expected_address_is_the_payout_the_payload_names(self):
+        for v in self.doc["vectors"]:
+            with self.subTest(v["name"]):
+                self.assertEqual(v["expected_address"], v["c3"]["payout"])
+                self.assertEqual(vc.bech32_decode(v["expected_address"])[1].hex(), v["expected_address_hex"])
+                network = "mainnet" if v["network"] == "mainnet" else "testnet"
+                self.assertEqual(vc.address_to_plutus_data(v["expected_address"], network)[1]["payment_kind"], "key")
+
+    def test_the_signer_is_the_published_fixture_key(self):
+        for v in self.doc["vectors"]:
+            if v["expect"]["accepted"]:
+                with self.subTest(v["name"]):
+                    self.assertEqual(v["expect"]["vkey_hex"], Fixture.vkey.hex())
+
+    def test_the_wrong_address_shares_the_key_and_differs_only_in_its_stake_part(self):
+        v = self.vectors["wrong-address-restaked"]
+        signed = vc.bech32_decode(v["signed_by_address"])[1]
+        expected = bytes.fromhex(v["expected_address_hex"])
+        self.assertEqual(signed[:29], expected[:29])
+        self.assertNotEqual(signed, expected)
+
+    def test_a_relayed_purpose_carries_a_signature_that_verifies_for_its_own_purpose(self):
+        """Refused for the purpose alone: the same proof is accepted where it was meant."""
+        for relayed, own in (("relayed-purpose-unbind-as-bind", "unbind-preprod-telegram"),
+                             ("relayed-purpose-bind-as-unbind", "bind-preprod-telegram")):
+            with self.subTest(relayed):
+                r, o = self.vectors[relayed], self.vectors[own]
+                self.assertEqual((r["cose_sign1_hex"], r["cose_key_hex"]), (o["cose_sign1_hex"], o["cose_key_hex"]))
+                self.assertNotEqual(r["expected_payload_text"], o["expected_payload_text"])
+
+    def test_the_lace_vector_is_the_kid_shape_and_the_others_are_not(self):
+        for v in self.doc["vectors"]:
+            with self.subTest(v["name"]):
+                protected = vc._cose_protected_bytes(bytes.fromhex(v["cose_sign1_hex"]))[0]
+                has_kid = protected.startswith(b"\xa3\x01\x27\x04")
+                self.assertEqual(has_kid, v["name"].startswith("lace-kid"))
+
+    def test_an_alert_binding_is_no_consent_and_a_consent_is_no_alert_binding(self):
+        """One fixture key signs both. Its bind proof is refused by the consent reader, and its
+        consent proof is refused by the alert envelope, so neither signature stands for the other."""
+        bind = self.vectors["lace-kid-bind-mainnet-telegram"]
+        doc = {"type": vc.CIP30_PROOF_TYPE, "address": bind["expected_address"],
+               "coseSign1": bind["cose_sign1_hex"], "coseKey": bind["cose_key_hex"]}
+        with self.assertRaises(vc.CeremonyError) as caught:
+            verify_lace_ceremony(doc)
+        self.assertIn("not a v2 consent statement", str(caught.exception))
+        with self.assertRaises(vc.CoseRejected) as caught:
+            vc.verify_cip30_envelope(Fixture.lace["coseSign1"], Fixture.lace["coseKey"],
+                                     bind["expected_payload_text"].encode(), Fixture.address)
+        self.assertEqual(caught.exception.code, "payload_mismatch")
 
 
 if __name__ == "__main__":

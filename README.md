@@ -60,6 +60,18 @@ What no tool can establish: that you are the *only* holder of that key. That
 follows from you having generated it yourself and produced the signature yourself.
 **If we handed you either one, the verdict is worth nothing.**
 
+A wallet proof is accepted in exactly two shapes:
+
+| wallet | COSE protected header | COSE_Key |
+|---|---|---|
+| lucid, Eternl | `{1: -8, "address": <address>}` | `{1: 1, 3: -8, -1: 6, -2: <32-byte key>}` |
+| Lace, any `@cardano-sdk/key-management` wallet | `{1: -8, 4: <address>, "address": <address>}` | `{1: 1, 2: <address>, 3: -8, -1: 6, -2: <32-byte key>}` |
+
+The `kid` (label 4, and label 2 of the key) must be the signing address byte for byte.
+Any other kid, any other label, a kid in the unsigned header, or a key that does not match
+the header's shape is refused. `testdata/cip30-lace-kid-vectors.json` holds one genuine
+proof of each shape.
+
 ### Consenting to be market-made
 
 The keeper quotes a book only under a v2 consent statement its owner signed: fifteen plain
@@ -87,6 +99,46 @@ on the terms below." and name the token, the fee bound, your price limits and th
  "terms": {"spreadBps": 800, "maxDepthAda": 120, "dailyLossBps": 500, "minRepriceBps": 150},
  "signedAt": "2026-09-24T12:00:00Z"}
 ```
+
+## Checking a CIP-30 signature in your own code
+
+The tool reads every wallet proof through one function, and a service can call it directly:
+
+```python
+from verify_ceremony import verify_cip30_envelope, CoseRejected
+
+vkey = verify_cip30_envelope(cose_sign1_hex, cose_key_hex, expected_payload, expected_address)
+```
+
+It returns the 32-byte ed25519 key that signed exactly `expected_payload` (bytes) from
+`expected_address` (the address as raw bytes), or raises `CoseRejected`, whose
+`code` says why. The payload is never read out of the proof: you say what must have been signed.
+The function proves that the key the address pays to signed. **Whose key that is remains your
+check**: compare the key's hash with the owner you expect. A non-bytes argument, or bytes that are
+no Shelley address, is a mistake in the calling code and raises `TypeError` or `ValueError`.
+
+| `code` | refused because |
+|---|---|
+| `cbor_malformed` | not hex, not one COSE_Sign1, or CBOR that does not decode |
+| `cbor_noncanonical` | a head wider than shortest form, or an indefinite length |
+| `trailing_bytes` | bytes after the COSE_Sign1, or inside the protected header after its map |
+| `protected_labels` | the protected header is not exactly one of the two shapes above |
+| `alg_not_eddsa` | the algorithm is not EdDSA (-8) |
+| `address_mismatch` | the header's address is not `expected_address`, byte for byte |
+| `unprotected_not_hashed_false` | the unsigned header is not `{}` or exactly `{hashed: false}` |
+| `payload_mismatch` | the signed payload is not `expected_payload`, or there is none |
+| `cose_key_shape` | the COSE_Key is not one of the two shapes above, or carries an extended key |
+| `small_order_key` | the key is a small-order point, which has no private half |
+| `script_payment_credential` | the address pays to a script, which no wallet key signs for |
+| `reward_address` | the address is a reward address, signed for with a stake key |
+| `key_hash_mismatch` | the key is not the one the address pays to |
+| `bad_signature` | the ed25519 signature does not verify |
+
+`testdata/cip30-alert-vectors.json` holds wallet-library proofs over the SaturnSwap MMaaS alert
+binding payloads, each with its expected verdict: a bind and an unbind, a Lace bind, a signature
+relayed to the other purpose, a wallet whose stake part differs from the expected address, a
+small-order forgery, and trailing bytes. They are signed by a published test key that was never
+funded, and `node tools/gen_cip30_vectors.mjs alert` regenerates them byte for byte.
 
 ## The published mainnet parameters
 
