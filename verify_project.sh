@@ -146,6 +146,9 @@ python3 consent_v2_test.py
 gate "CIP-30 wallet proofs: real v2 consent vectors, v1 for audit"
 python3 cip30_possession_test.py
 
+gate "the CIP-30 envelope (contract C4) and the alert binding vectors"
+python3 cip30_envelope_test.py
+
 gate "the ceremony verifier agrees with the built blueprint"
 python3 verify_ceremony_test.py
 
