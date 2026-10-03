@@ -401,6 +401,14 @@ class DecoderHardening(unittest.TestCase):
         with self.assertRaises(vc.CeremonyError):
             vc.cbor_load(b"\xa2\x01\x01\x01\x02")
 
+    def test_map_keys_holding_one_map_in_two_orders_are_one_key(self):
+        with self.assertRaises(vc.CeremonyError):
+            vc.cbor_load(b"\xa2" + b"\xa2\x01\x02\x03\x04\x00" + b"\xa2\x03\x04\x01\x02\x00")
+
+    def test_map_keys_holding_different_maps_are_two_keys(self):
+        decoded = vc.cbor_load(b"\xa2" + b"\xa1\x01\x02\x00" + b"\xa1\x01\x03\x00")
+        self.assertEqual(len(decoded), 2)
+
 
 
 class MyAddressIsFormScoped(unittest.TestCase):

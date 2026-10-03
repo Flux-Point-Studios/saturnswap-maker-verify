@@ -801,19 +801,11 @@ class _Cbor:
             pairs = []
             if indefinite:
                 while not self._at_break():
-                    pairs.append((_hashable(self.read()), self.read()))
+                    pairs.append((self._key(), self.read()))
             else:
                 for _ in range(arg):
-                    pairs.append((_hashable(self.read()), self.read()))
+                    pairs.append((self._key(), self.read()))
             for k, v in pairs:
-                # hash(True) == hash(1) in python, so a map keyed {true: -8} answers
-                # .get(1) — a COSE header carrying NO algorithm label would satisfy the
-                # algorithm check. Booleans and floats are not COSE labels; refuse them.
-                if self.strict and isinstance(k, (bool, float)):
-                    raise CoseRejected(
-                        "cbor_malformed",
-                        "a COSE map key must be an integer or a text string, and this one "
-                        "is neither")
                 if k in out:
                     raise CoseRejected(
                         "cbor_malformed",
@@ -833,6 +825,19 @@ class _Cbor:
             raise CoseRejected("cbor_malformed", f"unsupported CBOR simple/float value {arg}")
         raise CoseRejected("cbor_malformed", f"unsupported CBOR major type {major}")
 
+    def _key(self):
+        """A map key, judged the moment it is read. A COSE label is an integer or a text string,
+        and anything else is refused before it costs more than its own bytes. hash(True) ==
+        hash(1) in python, so a map keyed {true: -8} would answer .get(1): a COSE header carrying
+        NO algorithm label would satisfy the algorithm check."""
+        key = self.read()
+        if self.strict and (type(key) is not int and type(key) is not str):
+            raise CoseRejected(
+                "cbor_malformed",
+                "a COSE map key must be an integer or a text string, and this one "
+                "is neither")
+        return _hashable(key)
+
     def _at_break(self):
         self._need(1)
         if self.b[self.i] == 0xFF:
@@ -844,13 +849,14 @@ class _Cbor:
 def _hashable(key):
     """CBOR map keys are rarely composite, but Conway's redeemers map is keyed by [tag, index]
     arrays. This verifier only ever looks up int and byte-string keys; composite keys just need a
-    hashable stand-in so decoding does not abort."""
+    hashable stand-in so decoding does not abort. The stand-in is structural, never a repr: a
+    repr of a repr re-escapes every quote below it, so a map nested n deep as a key costs 2^n."""
     if isinstance(key, list):
         return tuple(_hashable(k) for k in key)
     if isinstance(key, _Tag):
         return ("__tag__", key.tag, _hashable(key.value))
     if isinstance(key, dict):
-        return tuple(sorted((repr(k), _hashable(v)) for k, v in key.items()))
+        return frozenset((k, _hashable(v)) for k, v in key.items())
     return key
 
 
@@ -1330,9 +1336,11 @@ def _cose_sign1_parts(cose_sign1):
             "refused")
 
     # The unprotected bucket is NOT covered by the signature, so it is attacker-mutable
-    # in both directions: padding it produces byte-different files that verify alike
-    # (defeating anything keyed on a proof's bytes), and setting hashed=true on someone
-    # else's genuine proof forces a refusal. A byte comparison closes both.
+    # in both directions: padding it produces byte-different files that verify alike,
+    # and setting hashed=true on someone else's genuine proof forces a refusal. A byte
+    # comparison closes both, down to the two spellings wallets write: one signature is
+    # still two valid files, so replay protection keys on the signed payload's nonce,
+    # never on a proof's bytes.
     start = reader.i
     unprotected = reader.read()
     if not isinstance(unprotected, dict):

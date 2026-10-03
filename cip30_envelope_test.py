@@ -15,6 +15,8 @@ import inspect
 import json
 import os
 import random
+import resource
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -322,6 +324,104 @@ class NothingButACodedRefusal(unittest.TestCase):
                     vkey = self.assert_coded(doc["coseSign1"], doc["coseKey"])
                     if vkey is not None:
                         self.assertEqual(vkey, Fixture.vkey)
+
+
+CAPPED_CHILD = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import verify_ceremony as vc
+mode, backend, args = sys.argv[2], sys.argv[3], [bytes.fromhex(a) for a in sys.argv[4:]]
+if backend == "pure":
+    vc._NACL_SIGNING = None
+try:
+    if mode == "envelope":
+        vc.verify_cip30_envelope(args[0].hex(), args[1].hex(), args[2], args[3])
+        print("accepted")
+    else:
+        print(type(vc.cbor_load(args[0])).__name__)
+except vc.CoseRejected as refusal:
+    print(refusal.code)
+"""
+CAPPED_ADDRESS_SPACE = 256 << 20
+
+
+def capped(mode, backend, *items):
+    """CAPPED_CHILD's verdict on `items`, decoded in a child held to 256 MiB of address space and
+    killed after 10 s: a decoder whose cost explodes dies alone and fails its case, rather than
+    taking the host running the suite with it."""
+    def limit():
+        resource.setrlimit(resource.RLIMIT_AS, (CAPPED_ADDRESS_SPACE, CAPPED_ADDRESS_SPACE))
+    run = subprocess.run([sys.executable, "-c", CAPPED_CHILD, HERE, mode, backend, *(i.hex() for i in items)],
+                         preexec_fn=limit, capture_output=True, text=True, timeout=10)
+    return run.stdout.strip() or (run.stderr.strip().splitlines() or ["no output"])[-1]
+
+
+def nested_map_keys(depth):
+    """A map whose one key is a map whose one key is a map ... `depth` maps down to {}."""
+    item = b"\xa0"
+    for _ in range(depth):
+        item = b"\xa1" + item + b"\x00"
+    return item
+
+
+class BoundedDecoding(unittest.TestCase):
+    """A proof costs memory and time in proportion to its length. The alert API hands this decoder
+    a client's bytes, so a 200-byte proof that needs gigabytes is a way to take the service down."""
+
+    DEPTH = vc._CBOR_MAX_DEPTH - 4
+
+    def hostile(self, where):
+        nested = nested_map_keys(self.DEPTH)
+        if where == "protected":
+            return Fixture.signed(b"\xa3\x01\x27\x67address" + bstr(Fixture.address) + nested + b"\x00")
+        return Fixture.signed(unprotected=nested)
+
+    def test_maps_nested_as_map_keys_are_refused_inside_the_budget(self):
+        for where in ("protected", "unprotected"):
+            for backend in ("libsodium", "pure"):
+                with self.subTest(where=where, backend=backend):
+                    cose_sign1_hex, cose_key_hex = self.hostile(where)
+                    self.assertEqual(capped("envelope", backend, bytes.fromhex(cose_sign1_hex),
+                                            bytes.fromhex(cose_key_hex), Fixture.payload, Fixture.address),
+                                     "cbor_malformed")
+
+    def test_the_budget_holds_a_genuine_proof(self):
+        """Positive control: the cap leaves room for the work a real proof needs."""
+        for backend in ("libsodium", "pure"):
+            with self.subTest(backend=backend):
+                self.assertEqual(capped("envelope", backend, bytes.fromhex(Fixture.lace["coseSign1"]),
+                                        bytes.fromhex(Fixture.lace["coseKey"]), Fixture.payload,
+                                        Fixture.address), "accepted")
+
+    def test_the_lenient_reader_decodes_maps_nested_as_map_keys_inside_the_budget(self):
+        """verify_create_body reads an operator's transaction without `strict`, through the same
+        decoder: composite keys stay legal there, and must cost no more than their length."""
+        self.assertEqual(capped("cbor_load", "libsodium", nested_map_keys(self.DEPTH)), "dict")
+
+    def test_a_strict_map_judges_each_key_before_it_is_made_hashable(self):
+        protected = b"\xa3\x01\x27\x67address" + bstr(Fixture.address) + nested_map_keys(3) + b"\x00"
+        with mock.patch.object(vc, "_hashable", wraps=vc._hashable) as spy:
+            with self.assertRaises(vc.CoseRejected) as caught:
+                envelope(*Fixture.signed(protected))
+        self.assertEqual(caught.exception.code, "cbor_malformed")
+        for call in spy.call_args_list:
+            self.assertIn(type(call.args[0]), (int, str), call.args[0])
+
+    def test_a_map_key_that_is_no_cose_label_is_cbor_malformed(self):
+        """COSE labels are integers or text strings (RFC 9052: label = int / tstr). Any other key is
+        refused where it is read, in either header, whatever its value."""
+        keys = {"bytes": b"\x41\x04", "null": b"\xf6", "undefined": b"\xf7", "true": b"\xf5",
+                "false": b"\xf4", "an array": b"\x81\x04", "a map": b"\xa0", "a tag": b"\xc1\x04"}
+        for name, key in keys.items():
+            for where in ("protected", "unprotected"):
+                with self.subTest(key=name, where=where):
+                    if where == "protected":
+                        proof = Fixture.signed(b"\xa3\x01\x27\x67address" + bstr(Fixture.address) + key + b"\x00")
+                    else:
+                        proof = Fixture.signed(unprotected=b"\xa2\x66hashed\xf4" + key + b"\x00")
+                    with self.assertRaises(vc.CoseRejected) as caught:
+                        envelope(*proof)
+                    self.assertEqual(caught.exception.code, "cbor_malformed", str(caught.exception))
 
 
 class OneBody(unittest.TestCase):

@@ -134,6 +134,14 @@ no Shelley address, is a mistake in the calling code and raises `TypeError` or `
 | `key_hash_mismatch` | the key is not the one the address pays to |
 | `bad_signature` | the ed25519 signature does not verify |
 
+A proof's bytes do not identify it. The unsigned header lies outside the signature and may be `{}`
+(a wallet that writes no unsigned header) or `{hashed: false}`, and hex has more than one spelling,
+so one signature can arrive as several byte-different proofs that all verify. Key replay protection
+and de-duplication on the single-use nonce inside `expected_payload`, never on `cose_sign1`.
+
+A map key in either header that is not an integer or a text string is `cbor_malformed` as soon as
+it is read, so a proof costs time and memory in proportion to its length.
+
 `testdata/cip30-alert-vectors.json` holds wallet-library proofs over the SaturnSwap MMaaS alert
 binding payloads, each with its expected verdict: a bind and an unbind, a Lace bind, a signature
 relayed to the other purpose, a wallet whose stake part differs from the expected address, a
