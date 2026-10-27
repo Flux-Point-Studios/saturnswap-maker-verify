@@ -393,6 +393,16 @@ def verify_body(body, ceremony, fund_bech32, max_fee, expect_pair):
     # The datum's pair must be the one YOU said you are funding. Read from the datum
     # alone, every downstream pair check would be the body agreeing with itself.
     a1_declared, a2_declared = expect_pair
+    # payout_bound's `conserved` exempts every asset under the beacon policy from conservation, so a
+    # beacon_id equal to a traded asset's policy makes that asset exempt too, and a bot-signed cancel
+    # could carry it out of your order. No sound per-asset reasoning survives that collision, so refuse
+    # the ceremony at its root, the way the datum-pair mismatch below does.
+    if beacon_id in {a1_declared[0], a2_declared[0]}:
+        refusals.append(
+            f"the ceremony's beacon_id {beacon_id} is also a traded asset's policy. payout_bound "
+            f"exempts assets under the beacon policy from conservation, so that asset could be swept "
+            f"out of your order by a bot-signed cancel. Refuse this ceremony.")
+        return refusals, assertions
     datum_pair = ((fields[2]["bytes"], fields[3]["bytes"]), (fields[5]["bytes"], fields[6]["bytes"]))
     if datum_pair != (a1_declared, a2_declared):
         refusals.append(
