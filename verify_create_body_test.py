@@ -431,6 +431,21 @@ def test_order_holding_only_beacons_and_ada_is_allowed(fx):
     _only(_refusals(fx, _body(fx, [out, _change_out(fx)])), "extraneous", junk.hex())
 
 
+def test_beacon_id_colliding_with_a_traded_policy_is_refused(fx):
+    """A ceremony whose beacon_id equals a traded asset's policy is unsafe at its root.
+
+    payout_bound's `conserved` exempts every asset under the beacon policy from conservation. If
+    beacon_id IS a traded asset's policy, that asset is exempt too, so a bot-signed cancel can carry
+    it out of the order to the bot's own address. The gate refuses such a ceremony before it judges
+    the body, the way it refuses a datum that does not trade the pair you declared. Without the guard
+    the body is still refused, but for a cryptic beacon-holdings reason that never names the defect.
+    """
+    collide = ((fx.beacon.hex(), TOK_NAME.hex()), (TOK_POL.hex(), TOK_NAME.hex()))
+    _only(_refusals(fx, vcb.load_body(fx.honest), expect_pair=collide), "beacon_id", "policy")
+    # Boundary: the real pair does not collide, so the honest body still verifies with no refusal.
+    assert _refusals(fx, vcb.load_body(fx.honest)) == []
+
+
 def test_datum_declaring_a_foreign_asset2_is_refused(fx):
     """The gate must not take the traded pair from the body it is auditing.
 
